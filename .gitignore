@@ -1,0 +1,12 @@
+config.yaml
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.idea/
+.vscode/
+.YL1203Code/
+.claude/
+CLAUDE.md
