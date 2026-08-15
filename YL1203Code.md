@@ -70,7 +70,5 @@ YL1203Code/            # 主包
 - 指令文件：`YL1203Code.md` 与 `AGENTS.md`（发现顺序：用户全局 → 项目目录链 → 本地覆盖，详见 `memory/instructions.py`）。
 
 ## 代码规范
-
-- commit message 用英文。
 - 变量命名用 snake_case。
 - 模块、类、函数命名遵循 [PEP 8](https://peps.python.org/pep-0008/)。
