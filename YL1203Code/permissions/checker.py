@@ -82,6 +82,14 @@ class PermissionChecker:
 
     def check(self, tool: Tool, arguments: dict[str, Any]) -> Decision:
         content = extract_content(tool.name, arguments)
+        path = arguments.get("path", ".") if tool.name in ("Glob", "Grep") else content
+
+        # Explicit rules take precedence over automatic command approval.
+        rule_result = self.rule_engine.evaluate(tool.name, content)
+        if rule_result == "deny":
+            return Decision(effect="deny", reason="权限规则拒绝")
+        if rule_result == "ask":
+            return Decision(effect="ask", reason="权限规则要求确认")
 
         # Layer 0: Plan 模式例外放行
         if self.mode == PermissionMode.PLAN:
@@ -123,17 +131,14 @@ class PermissionChecker:
             return Decision(effect="allow", reason="OS 沙箱自动放行")
 
         # Layer 2: 路径沙箱（仅文件类工具）
-        if tool.category in ("read", "write") and content:
-            ok, reason = self.sandbox.check(content)
+        if tool.category in ("read", "write") and path:
+            ok, reason = self.sandbox.check(str(path))
             if not ok and self.mode != PermissionMode.BYPASS:
                 return Decision(effect="ask", reason=f"路径沙箱拦截: {reason}")
 
         # Layer 3: 规则引擎匹配
-        rule_result = self.rule_engine.evaluate(tool.name, content)
         if rule_result == "allow":
             return Decision(effect="allow", reason="权限规则放行")
-        if rule_result == "deny":
-            return Decision(effect="deny", reason="权限规则拒绝")
 
         # Layer 4b: 会话级放行（内存中，优先于模式兜底）
         if self._check_session_allowed(tool.name, content or ""):

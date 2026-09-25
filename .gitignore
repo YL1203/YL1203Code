@@ -10,3 +10,7 @@ build/
 .YL1203Code/
 .claude/
 CLAUDE.md
+.workbuddy-ai/
+.pytest_cache/
+.coverage
+htmlcov/

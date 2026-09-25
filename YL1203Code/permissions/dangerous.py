@@ -17,17 +17,8 @@ _DANGEROUS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 
 _SAFE_COMMANDS = frozenset({
-    "ls", "dir", "pwd", "echo", "cat", "head", "tail", "wc",
-    "find", "which", "whereis", "whoami", "hostname", "uname",
-    "date", "cal", "uptime", "df", "du", "free", "env", "printenv",
-    "file", "stat", "readlink", "realpath", "basename", "dirname",
-    "sort", "uniq", "tr", "cut", "awk", "sed", "grep", "egrep", "fgrep",
-    "diff", "comm", "tee", "xargs", "true", "false", "test",
-    "git status", "git log", "git diff", "git show", "git branch",
-    "git tag", "git remote", "git rev-parse", "git ls-files",
-    "git blame", "git stash list", "go version", "go env",
-    "node -v", "npm -v", "npx", "python --version", "pip list",
-    "cargo --version", "rustc --version", "java -version", "java --version",
+    "ls", "dir", "pwd", "whoami", "hostname", "date",
+    "git status", "git log", "git diff", "git show", "git ls-files",
 })
 
 
@@ -35,13 +26,13 @@ def is_safe_command(command: str) -> bool:
     trimmed = command.strip()
     if not trimmed:
         return False
-    for ch in ("|", ";", "&&", ">", "$(", "`"):
+    # Shell metacharacters can turn an apparently read-only command into a write
+    # or execute another command. Require approval for such expressions.
+    for ch in ("|", ";", "&", ">", "<", "$", "`", "\n", "\r", "(", ")", "^"):
         if ch in trimmed:
             return False
-    for safe in _SAFE_COMMANDS:
-        if trimmed == safe or trimmed.startswith(safe + " "):
-            return True
-    return False
+    # Arguments can name files outside the workspace or enable write options.
+    return " ".join(trimmed.split()) in _SAFE_COMMANDS
 
 
 class DangerousCommandDetector:

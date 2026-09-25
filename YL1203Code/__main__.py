@@ -49,7 +49,7 @@ def main() -> None:
         "--remote",
         action="store_true",
         default=False,
-        help="Start in remote mode: WebSocket server on 0.0.0.0:18888 with browser UI",
+        help="Start in remote mode: WebSocket server on 127.0.0.1:18888 with browser UI",
     )
     args = parser.parse_args()
 
@@ -83,6 +83,7 @@ def main() -> None:
             providers=config.providers,
             mcp_servers=config.mcp_servers,
             hook_engine=hook_engine,
+            permission_mode=permission_mode,
         )
         asyncio.run(server.run())
         return
@@ -137,6 +138,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     from YL1203Code.agents.trace import TraceManager
     from YL1203Code.tools.agent_tool import AgentTool
     from YL1203Code.tools.impl.tool_search import ToolSearchTool
+    from YL1203Code.mcp import MCPManager
     from YL1203Code.teams.manager import TeamManager
     from YL1203Code.teams.models import BackendType
     from YL1203Code.tools.team_create import TeamCreateTool
@@ -172,6 +174,18 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     instructions = load_instructions(work_dir)
     registry = create_default_registry()
     registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    mcp_manager = None
+    mcp_instructions: list[str] = []
+    if config.mcp_servers:
+        mcp_manager = MCPManager()
+        mcp_manager.load_configs(config.mcp_servers)
+        connected = await mcp_manager.register_all_tools(registry)
+        for error in connected.errors:
+            print(error, file=sys.stderr, flush=True)
+        mcp_instructions = [
+            f"## {server.name}\n{server.instructions}"
+            for server in connected.servers if server.instructions
+        ]
 
     agent = Agent(
         client=client,
@@ -234,6 +248,10 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     # 使用事件驱动的 agent.run()，支持 text 和 stream-json 两种输出格式
     conv = ConversationManager()
     conv.add_user_message(prompt)
+    if mcp_instructions:
+        conv.add_system_reminder(
+            "# MCP Server Instructions\n\n" + "\n\n".join(mcp_instructions)
+        )
 
     start = time.monotonic()
     text_buf = ""
@@ -324,11 +342,14 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                 emit_json({"type": "retry", "reason": event.reason})
 
         elif isinstance(event, PermissionRequest):
-            # -p 非交互模式：自动批准所有权限请求
-            event.future.set_result(PermissionResponse.ALLOW)
+            # Non-interactive runs cannot ask for consent. Explicit bypass
+            # mode is required for unattended operations needing approval.
+            event.future.set_result(PermissionResponse.DENY)
 
     # 如果有 team 在运行，轮询等待 teammate 完成
     if not team_manager._teams:
+        if mcp_manager is not None:
+            await mcp_manager.shutdown()
         return
 
     for i in range(90):
@@ -354,7 +375,9 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         else:
             print(last_result, flush=True)
 
+    if mcp_manager is not None:
+        await mcp_manager.shutdown()
+
 
 if __name__ == "__main__":
     main()
-

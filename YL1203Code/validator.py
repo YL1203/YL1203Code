@@ -147,6 +147,7 @@ def validate_mcp_servers(raw_mcp: list | None) -> list[dict]:
                 "url": entry.get("url"),
                 "headers": entry.get("headers", {}),
                 "env": entry.get("env", {}),
+                "timeout": entry.get("timeout", 60.0),
             }
         )
 

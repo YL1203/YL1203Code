@@ -111,6 +111,7 @@ class MCPServerConfig:
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
+    timeout: float = 60.0
 
 
     @property
@@ -145,6 +146,9 @@ class AppConfig:
     teammate_mode: str = ""
     enable_coordinator_mode: bool = False
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
+    # Track keys present in each YAML layer so explicit false/default values
+    # can override an earlier layer.
+    _specified: dict[str, set[str]] = field(default_factory=dict, repr=False)
 
 
 def _load_single_file(path: Path) -> AppConfig:
@@ -177,6 +181,7 @@ def _load_single_file(path: Path) -> AppConfig:
             url=s["url"],
             headers=s["headers"],
             env=s["env"],
+            timeout=s["timeout"],
         )
         for s in validated["mcp_servers"]
     ]
@@ -206,16 +211,28 @@ def _load_single_file(path: Path) -> AppConfig:
         teammate_mode=validated["teammate_mode"],
         enable_coordinator_mode=validated["enable_coordinator_mode"],
         sandbox=sandbox_cfg,
+        _specified={
+            "top": set(raw),
+            "worktree": set(raw.get("worktree") or {}),
+            "sandbox": set(raw.get("sandbox") or {}),
+        },
     )
 
 
 def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
-    if override.providers:
+    keys = override._specified.get("top", set())
+    if "providers" in keys:
         base.providers = override.providers
-    if override.permission_mode != "default":
-        base.permission_mode = override.permission_mode
+    for key in (
+        "permission_mode", "enable_fork", "enable_verification_agent",
+        "teammate_mode", "enable_coordinator_mode",
+    ):
+        if key in keys:
+            setattr(base, key, getattr(override, key))
 
-    if override.mcp_servers:
+    if "mcp_servers" in keys:
+        if not override.mcp_servers:
+            base.mcp_servers = []
         by_name = {s.name: i for i, s in enumerate(base.mcp_servers)}
         for s in override.mcp_servers:
             if s.name in by_name:
@@ -224,22 +241,12 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
                 base.mcp_servers.append(s)
                 by_name[s.name] = len(base.mcp_servers) - 1
 
-    base.raw_hooks.extend(override.raw_hooks)
-    if override.enable_fork:
-        base.enable_fork = True
-    if override.enable_verification_agent:
-        base.enable_verification_agent = True
-    if override.teammate_mode:
-        base.teammate_mode = override.teammate_mode
-    if override.enable_coordinator_mode:
-        base.enable_coordinator_mode = True
-    # 沙箱配置：后层覆盖前层（任一字段为非默认值即覆盖）
-    if override.sandbox.enabled:
-        base.sandbox.enabled = True
-    if override.sandbox.auto_allow:
-        base.sandbox.auto_allow = True
-    if override.sandbox.network_enabled:
-        base.sandbox.network_enabled = True
+    if "hooks" in keys:
+        base.raw_hooks.extend(override.raw_hooks)
+    for key in override._specified.get("worktree", set()):
+        setattr(base.worktree, key, getattr(override.worktree, key))
+    for key in override._specified.get("sandbox", set()):
+        setattr(base.sandbox, key, getattr(override.sandbox, key))
     return base
 
 

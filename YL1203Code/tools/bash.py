@@ -162,5 +162,4 @@ class Bash(Tool):
         if not output:
             output = "(no output)"
 
-        return ToolResult(output=output, is_error=False)
-
+        return ToolResult(output=output, is_error=_interpret_exit_code(params.command, exit_code))

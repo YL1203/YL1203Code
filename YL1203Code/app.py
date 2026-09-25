@@ -712,9 +712,7 @@ class YL1203CodeApp(App):
         home = Path.home()
 
         # 根据配置决定是否启用 OS 级沙箱自动放行
-        sandbox_auto_allow = (
-            self._sandbox_cfg.enabled and self._sandbox_cfg.auto_allow
-        )
+        sandbox_auto_allow = False
         checker = PermissionChecker(
             detector=DangerousCommandDetector(),
             sandbox=PathSandbox(work_dir),
@@ -744,6 +742,7 @@ class YL1203CodeApp(App):
                 if bash_tool:
                     bash_tool.sandbox = os_sandbox
                     bash_tool.sandbox_config = sandbox_config
+                    checker.sandbox_enabled = self._sandbox_cfg.auto_allow
 
         self._instructions_content = load_instructions(work_dir)
         self.memory_manager = MemoryManager(work_dir)

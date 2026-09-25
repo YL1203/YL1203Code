@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any, AsyncIterator
 from unittest.mock import patch
 
@@ -250,7 +251,7 @@ class TestCommandExecutor:
     async def test_timeout(self):
         from YL1203Code.hooks.executors import execute_command
 
-        action = Action(type="command", command="sleep 10", timeout=1)
+        action = Action(type="command", command=f'"{sys.executable}" -c "import time; time.sleep(10)"', timeout=1)
         ctx = HookContext()
         result = await execute_command(action, ctx)
         assert result.success is False

@@ -70,7 +70,12 @@ class PathSandbox:
             real_path = abs_path.resolve(strict=True)
         except OSError:
             ancestor = abs_path
-            while not ancestor.exists():
+            while True:
+                try:
+                    if ancestor.exists():
+                        break
+                except OSError:
+                    return False, f"无法访问路径: {path}"
                 parent = ancestor.parent
                 if parent == ancestor:
                     return False, f"无法解析路径: {path}"

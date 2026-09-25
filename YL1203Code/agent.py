@@ -42,6 +42,7 @@ from YL1203Code.prompts import build_environment_context, build_plan_mode_remind
 from YL1203Code.tools import ToolRegistry
 from YL1203Code.tools.base import (
     MAX_OUTPUT_CHARS,
+    Tool,
     StreamEnd,
     StreamEvent,
     TextDelta,
@@ -238,7 +239,10 @@ def partition_tool_calls(
     batches: list[ToolBatch] = []
     for tc in tool_calls:
         tool = registry.get(tc.tool_name)
-        safe = tool is not None and tool.is_concurrency_safe and registry.is_enabled(tc.tool_name)
+        safe = (
+            tool is not None and tool.category == "read"
+            and tool.is_concurrency_safe and registry.is_enabled(tc.tool_name)
+        )
 
         if safe and batches and batches[-1].concurrent:
             batches[-1].calls.append(tc)
@@ -262,28 +266,31 @@ class _ToolExecResult:
 
 class StreamingExecutor:
     def __init__(self) -> None:
-        self._tasks: list[tuple[int, asyncio.Task[_ToolExecResult]]] = []
+        self._tasks: list[tuple[int, str, str, asyncio.Task[_ToolExecResult]]] = []
         self._order = 0
 
     def submit(
         self,
         coro: Any,
+        tool_id: str = "",
+        tool_name: str = "",
     ) -> None:
         task = asyncio.create_task(coro)
-        self._tasks.append((self._order, task))
+        self._tasks.append((self._order, tool_id, tool_name, task))
         self._order += 1
 
     async def collect_results(self) -> list[_ToolExecResult]:
         if not self._tasks:
             return []
-        tasks = [t for _, t in sorted(self._tasks, key=lambda x: x[0])]
+        ordered = sorted(self._tasks, key=lambda x: x[0])
+        tasks = [t for _, _, _, t in ordered]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[_ToolExecResult] = []
-        for r in results:
+        for (_, tool_id, tool_name, _), r in zip(ordered, results):
             if isinstance(r, Exception):
                 out.append(_ToolExecResult(
-                    tool_id="",
-                    tool_name="",
+                    tool_id=tool_id,
+                    tool_name=tool_name,
                     result=ToolResult(output=f"Tool execution error: {r}", is_error=True),
                     elapsed=0.0,
                     is_unknown=False,
@@ -291,6 +298,13 @@ class StreamingExecutor:
             else:
                 out.append(r)
         return out
+
+    async def cancel_pending(self) -> None:
+        tasks = [task for _, _, _, task in self._tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -562,21 +576,31 @@ class Agent:
             executor = StreamingExecutor()
             deferred_tool_calls: list[ToolCallComplete] = []
             llm_stream = self.client.stream(conversation, system=system, tools=tools)
-            async for event in collector.consume(llm_stream):
-                # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
-                if isinstance(event, ToolUseEvent):
-                    tc = collector.response.tool_calls[-1]
-                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
-                    tool = self.registry.get(tc.tool_name)
-                    needs_ask = False
-                    if tool and self.permission_checker:
-                        decision = self.permission_checker.check(tool, tc.arguments)
-                        needs_ask = decision.effect == "ask"
-                    if needs_ask:
-                        deferred_tool_calls.append(tc)
-                    else:
-                        executor.submit(self._execute_single_tool_direct(tc))
-                yield event
+            stream_completed = False
+            try:
+                async for event in collector.consume(llm_stream):
+                    # Read-only tools may run while the model is streaming.
+                    if isinstance(event, ToolUseEvent):
+                        tc = collector.response.tool_calls[-1]
+                        tool = self.registry.get(tc.tool_name)
+                        needs_ask = False
+                        if tool and self.permission_checker:
+                            decision = self.permission_checker.check(tool, tc.arguments)
+                            needs_ask = decision.effect == "ask"
+                        if (
+                            needs_ask or not tool or tool.category != "read"
+                            or not tool.is_concurrency_safe or deferred_tool_calls
+                        ):
+                            deferred_tool_calls.append(tc)
+                        else:
+                            executor.submit(
+                                self._execute_single_tool_direct(tc), tc.tool_id, tc.tool_name
+                            )
+                    yield event
+                stream_completed = True
+            finally:
+                if not stream_completed:
+                    await executor.cancel_pending()
 
             response = collector.response
 
@@ -598,7 +622,7 @@ class Agent:
                 for tb in response.thinking_blocks
             ]
 
-            if response.stop_reason == "max_tokens":
+            if response.stop_reason == "max_tokens" and not response.tool_calls:
                 if not max_tokens_escalated:
                     self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
                     max_tokens_escalated = True
@@ -677,7 +701,7 @@ class Agent:
             )
 
             # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
-            tool_results: list[ToolResultBlock] = []
+            tool_results_by_id: dict[str, ToolResultBlock] = {}
             streaming_results = await executor.collect_results()
 
             for br in streaming_results:
@@ -688,12 +712,10 @@ class Agent:
                 content = self._maybe_persist_or_truncate(
                     br.tool_id, br.result.output
                 )
-                tool_results.append(
-                    ToolResultBlock(
-                        tool_use_id=br.tool_id,
-                        content=content,
-                        is_error=br.result.is_error,
-                    )
+                tool_results_by_id[br.tool_id] = ToolResultBlock(
+                    tool_use_id=br.tool_id,
+                    content=content,
+                    is_error=br.result.is_error,
                 )
                 yield ToolResultEvent(
                     tool_id=br.tool_id,
@@ -724,12 +746,10 @@ class Agent:
                     consecutive_unknown = 0
 
                 content = self._maybe_persist_or_truncate(tc.tool_id, result.output)
-                tool_results.append(
-                    ToolResultBlock(
-                        tool_use_id=tc.tool_id,
-                        content=content,
-                        is_error=result.is_error,
-                    )
+                tool_results_by_id[tc.tool_id] = ToolResultBlock(
+                    tool_use_id=tc.tool_id,
+                    content=content,
+                    is_error=result.is_error,
                 )
                 yield ToolResultEvent(
                     tool_id=tc.tool_id,
@@ -748,7 +768,11 @@ class Agent:
             exit_plan_called = any(
                 tc.tool_name == "ExitPlanMode" for tc in response.tool_calls
             )
-            conversation.add_tool_results_message(tool_results)
+            conversation.add_tool_results_message([
+                tool_results_by_id[tc.tool_id]
+                for tc in response.tool_calls
+                if tc.tool_id in tool_results_by_id
+            ])
 
             # 非阻塞 memory recall：工具执行完后检查 prefetch 是否就绪
             if self.memory_recall_task and not self._memory_recall_consumed:
@@ -795,6 +819,35 @@ class Agent:
         """为 HITL 权限确认生成人类可读的操作描述。"""
         return PermissionChecker.describe_tool_action(tc.tool_name, tc.arguments)
 
+    async def _invoke_tool(self, tc: ToolCallComplete, tool: Tool) -> ToolResult:
+        """Run a tool with the same hooks in every agent execution mode."""
+        file_path = self._infer_file_path(tc.arguments)
+        if self.hook_engine:
+            hook_ctx = self._build_hook_context(
+                "pre_tool_use", tool_name=tc.tool_name,
+                tool_args=tc.arguments, file_path=file_path,
+            )
+            rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
+            if rejection is not None:
+                return ToolResult(output=f"Hook rejected: {rejection.reason}", is_error=True)
+
+        try:
+            params = tool.params_model.model_validate(tc.arguments)
+            result = await tool.execute(params)
+        except ValidationError as e:
+            result = ToolResult(output=f"Parameter validation error: {e}", is_error=True)
+        except Exception as e:
+            result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
+
+        self._snapshot_for_recovery(tc, result)
+        if self.hook_engine:
+            hook_ctx = self._build_hook_context(
+                "post_tool_use", tool_name=tc.tool_name,
+                tool_args=tc.arguments, file_path=file_path,
+            )
+            await self.hook_engine.run_hooks("post_tool_use", hook_ctx)
+        return result
+
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
     ) -> _ToolExecResult:
@@ -830,15 +883,7 @@ class Agent:
                     is_unknown=False,
                 )
 
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(output=f"Parameter validation error: {e}", is_error=True)
-        except Exception as e:
-            result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
-
-        self._snapshot_for_recovery(tc, result)
+        result = await self._invoke_tool(tc, tool)
 
         return _ToolExecResult(
             tool_id=tc.tool_id,
@@ -924,19 +969,7 @@ class Agent:
                     # 同时加入会话级放行集合，本轮立即生效无需磁盘读取
                     self.permission_checker.add_session_allow(tc.tool_name, content)
 
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(
-                output=f"Parameter validation error: {e}", is_error=True
-            )
-        except Exception as e:
-            result = ToolResult(
-                output=f"Tool execution error: {e}", is_error=True
-            )
-
-        self._snapshot_for_recovery(tc, result)
+        result = await self._invoke_tool(tc, tool)
 
         elapsed = time.monotonic() - start
         yield result, elapsed, is_unknown
@@ -1220,21 +1253,6 @@ class Agent:
                 is_error=True,
             )
 
-        if self.hook_engine:
-            file_path = self._infer_file_path(tc.arguments)
-            hook_ctx = self._build_hook_context(
-                "pre_tool_use",
-                tool_name=tc.tool_name,
-                tool_args=tc.arguments,
-                file_path=file_path,
-            )
-            rejection = await self.hook_engine.run_pre_tool_hooks(hook_ctx)
-            if rejection is not None:
-                return ToolResult(
-                    output=f"Hook rejected: {rejection.reason}",
-                    is_error=True,
-                )
-
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
             if decision.effect == "deny":
@@ -1251,29 +1269,7 @@ class Agent:
                         is_error=True,
                     )
 
-        try:
-            params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
-        except ValidationError as e:
-            result = ToolResult(
-                output=f"Parameter validation error: {e}", is_error=True
-            )
-        except Exception as e:
-            result = ToolResult(
-                output=f"Tool execution error: {e}", is_error=True
-            )
-
-        if self.hook_engine:
-            file_path = self._infer_file_path(tc.arguments)
-            hook_ctx = self._build_hook_context(
-                "post_tool_use",
-                tool_name=tc.tool_name,
-                tool_args=tc.arguments,
-                file_path=file_path,
-            )
-            await self.hook_engine.run_hooks("post_tool_use", hook_ctx)
-
-        return result
+        return await self._invoke_tool(tc, tool)
 
     def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
         from YL1203Code.context.manager import (

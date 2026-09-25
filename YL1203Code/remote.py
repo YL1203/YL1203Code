@@ -16,6 +16,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import websockets
 from websockets.asyncio.server import Server as WSServer, ServerConnection
@@ -71,12 +72,14 @@ class RemoteServer:
         providers: list[ProviderConfig],
         mcp_servers: list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
-        addr: str = "0.0.0.0",
+        permission_mode: PermissionMode = PermissionMode.DEFAULT,
+        addr: str = "127.0.0.1",
         port: int = 18888,
     ) -> None:
         self.providers = providers
         self._mcp_server_configs = mcp_servers or []
         self.hook_engine = hook_engine
+        self.permission_mode = permission_mode
         self.addr = addr
         self.port = port
 
@@ -90,6 +93,7 @@ class RemoteServer:
         self.session_id: str = ""
         self._streaming = False
         self._cancel_event: asyncio.Event | None = None
+        self._active_task: asyncio.Task[None] | None = None
 
         # 权限请求的 pending 队列：id -> Future
         self._pending_perms: dict[str, asyncio.Future[PermissionResponse]] = {}
@@ -125,15 +129,19 @@ class RemoteServer:
         print(f"\n  Remote UI: http://localhost:{self.port}\n")
 
         # websockets 的 serve 支持 process_request 回调来处理普通 HTTP
-        async with websockets.serve(
-            self._ws_handler,
-            self.addr,
-            self.port,
-            process_request=self._process_http_request,
-            max_size=4 * 1024 * 1024,  # 4MB 消息上限
-        ):
-            # 服务器启动后永久阻塞
-            await asyncio.Future()
+        try:
+            async with websockets.serve(
+                self._ws_handler,
+                self.addr,
+                self.port,
+                process_request=self._process_http_request,
+                max_size=4 * 1024 * 1024,  # 4MB 消息上限
+            ):
+                # 服务器启动后永久阻塞
+                await asyncio.Future()
+        finally:
+            if self.mcp_manager is not None:
+                await self.mcp_manager.shutdown()
 
     # ------------------------------------------------------------------
     # HTTP 请求处理（为 / 路径提供前端 HTML）
@@ -145,6 +153,10 @@ class RemoteServer:
         """拦截 HTTP 请求，对 / 路径返回 HTML 页面。
         返回 None 表示继续走 WebSocket 升级流程。
         """
+        origin = request.headers.get("Origin")
+        host = request.headers.get("Host", "")
+        if origin and urlsplit(origin).hostname != urlsplit(f"//{host}").hostname:
+            return Response(403, "Forbidden", websockets.Headers(), b"Invalid origin")
         if request.path == "/":
             return Response(
                 200,
@@ -194,7 +206,10 @@ class RemoteServer:
                     content = data.get("content", "").strip()
                     if content:
                         # 在后台任务中处理，不阻塞 WebSocket 读循环
-                        asyncio.create_task(self._handle_user_message(content))
+                        if self._active_task is None or self._active_task.done():
+                            self._active_task = asyncio.create_task(
+                                self._handle_user_message(content)
+                            )
 
                 elif msg_type == "permission_response":
                     self._handle_permission_response(data)
@@ -202,6 +217,12 @@ class RemoteServer:
                 elif msg_type == "cancel":
                     if self._cancel_event is not None:
                         self._cancel_event.set()
+                    for future in self._pending_perms.values():
+                        if not future.done():
+                            future.set_result(PermissionResponse.DENY)
+                    self._pending_perms.clear()
+                    if self._active_task is not None:
+                        self._active_task.cancel()
 
                 elif msg_type == "ping":
                     # 应用层保活
@@ -231,7 +252,7 @@ class RemoteServer:
                 project_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.yaml",
                 local_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.local.yaml",
             ),
-            mode=PermissionMode.DEFAULT,
+            mode=self.permission_mode,
         )
 
         # 加载自定义指令和记忆
@@ -498,6 +519,8 @@ class RemoteServer:
         finally:
             self._streaming = False
             self._cancel_event = None
+            if self._active_task is asyncio.current_task():
+                self._active_task = None
 
     # ------------------------------------------------------------------
     # 斜杠命令处理
@@ -628,7 +651,8 @@ class RemoteServer:
 
     def send_user_message(self, text: str) -> None:
         """同步接口 — 注入用户消息并触发 agent。"""
-        asyncio.create_task(self._handle_user_message(text))
+        if self._active_task is None or self._active_task.done():
+            self._active_task = asyncio.create_task(self._handle_user_message(text))
 
     def set_plan_mode(self, enabled: bool) -> None:
         if self.agent is None:
