@@ -71,7 +71,7 @@ async def _handle_create(
         return
 
     try:
-        session = await manager.enter(name)
+        session = await manager.enter(name, original_work_dir=ctx.agent.work_dir if ctx.agent else None)
         if ctx.agent:
             ctx.agent.work_dir = wt.path
     except Exception as e:
@@ -118,7 +118,7 @@ async def _handle_enter(
 
     name = args[0]
     try:
-        session = await manager.enter(name)
+        session = await manager.enter(name, original_work_dir=ctx.agent.work_dir if ctx.agent else None)
         if ctx.agent:
             ctx.agent.work_dir = session.worktree_path
         ctx.ui.add_system_message(f"已进入 worktree: {name}\n路径: {session.worktree_path}")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,7 @@ class EnterWorktreeTool(Tool):
 
     def __init__(self, worktree_manager: WorktreeManager) -> None:
         self._manager = worktree_manager
+        self._set_work_dir: Callable[[str], None] | None = None
 
 
     async def execute(self, params: EnterWorktreeParams) -> ToolResult:
@@ -53,7 +54,9 @@ class EnterWorktreeTool(Tool):
 
         try:
             wt = await self._manager.create(slug)
-            session = await self._manager.enter(slug)
+            session = await self._manager.enter(slug, original_work_dir=self.work_dir)
+            if self._set_work_dir is not None:
+                self._set_work_dir(session.worktree_path)
         except Exception as e:
             return ToolResult(
                 output=f"Error creating worktree: {e}", is_error=True

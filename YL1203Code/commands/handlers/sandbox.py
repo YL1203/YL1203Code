@@ -10,6 +10,9 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 from YL1203Code.commands.registry import Command, CommandContext, CommandType
 
 
@@ -63,7 +66,7 @@ def _show_status(ctx: CommandContext) -> None:
     lines = [
         "沙箱状态",
         "─────────",
-        f"  OS 沙箱: {'已启用' if sandbox_on else '未启用'}",
+        f"  OS 沙箱: {'已启用' if os_sandbox else '未启用'}",
         f"  自动放行: {'是' if sandbox_on else '否'}",
         f"  沙箱后端: {type(os_sandbox).__name__ if os_sandbox else '无'}",
         f"  后端可用: {'是' if os_available else '否'}",
@@ -85,22 +88,23 @@ def _enable_sandbox(ctx: CommandContext, auto_allow: bool) -> None:
     if sandbox is None:
         sandbox = create_sandbox()
         if sandbox is None:
-            ctx.ui.add_system_message("错误: 当前系统不支持沙箱（仅支持 macOS / Linux）")
+            ctx.ui.add_system_message("错误: 当前系统没有可用的命令沙箱后端")
             return
 
     if not sandbox.available():
         backend = type(sandbox).__name__
-        ctx.ui.add_system_message(f"错误: 沙箱后端 {backend} 不可用，请安装对应工具")
+        ctx.ui.add_system_message(f"错误: 沙箱后端 {backend} 不可用；Windows 需运行中的 Linux Docker 服务和本地镜像。命令权限检查仍生效。")
         return
 
     # 构建沙箱配置：项目目录和临时目录可写
     work_dir = ctx.agent.work_dir
+    state = Path(work_dir) / ".YL1203Code"
+    state.mkdir(parents=True, exist_ok=True)
     config = SandboxConfig(
-        allow_write=[work_dir, "/tmp"],
-        deny_write=[
-            f"{work_dir}/.YL1203Code/config.yaml",
-            f"{work_dir}/.YL1203Code/permissions.local.yaml",
-        ],
+        allow_write=[work_dir, tempfile.gettempdir()],
+        deny_write=[str(state / name) for name in (
+            "config.yaml", "config.local.yaml", "permissions.local.yaml", "skills",
+        )],
         network_enabled=False,
     )
 

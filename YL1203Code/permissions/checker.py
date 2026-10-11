@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import copy
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +43,37 @@ class PermissionChecker:
         # Layer 4b: 会话级 allow-always 集合（内存中，不持久化）
         # 存放格式为 "ToolName:pattern"，用户选择 "don't ask again" 时记录
         self._session_allowed: set[str] = set()
+
+    def copy(self) -> PermissionChecker:
+        """Inherit policy without sharing mutable session approval state."""
+        checker = copy.copy(self)
+        checker._session_allowed = set(self._session_allowed)
+        checker.sandbox = self.sandbox.with_project_root(str(self.sandbox.project_root))
+        return checker
+
+    def rebind_work_dir(self, previous_dir: str, work_dir: str) -> None:
+        if self.sandbox.project_root == Path(previous_dir).resolve():
+            self.sandbox = self.sandbox.with_project_root(work_dir)
+
+    def for_child(self, mode: PermissionMode, work_dir: str,
+                  source_work_dir: str | None = None) -> PermissionChecker:
+        checker = self.copy()
+        ranks = {PermissionMode.PLAN: 0, PermissionMode.DEFAULT: 1,
+                 PermissionMode.ACCEPT_EDITS: 2, PermissionMode.BYPASS: 3}
+        checker.mode = min((self.mode, mode), key=ranks.__getitem__)
+        if source_work_dir is not None:
+            checker.rebind_work_dir(source_work_dir, work_dir)
+        return checker
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode.value, "root": str(self.sandbox.project_root),
+            "extra_allowed": list(self.sandbox._extra_allowed),
+            "deny_write": list(self.sandbox._deny_write_config),
+            "rules": [{"tool_name": rule.tool_name, "pattern": rule.pattern,
+                       "effect": rule.effect}
+                      for tier in self.rule_engine._load_tiers() for rule in reversed(tier)],
+        }
 
 
     def add_session_allow(self, tool_name: str, content: str) -> None:
@@ -83,6 +116,8 @@ class PermissionChecker:
     def check(self, tool: Tool, arguments: dict[str, Any]) -> Decision:
         content = extract_content(tool.name, arguments)
         path = arguments.get("path", ".") if tool.name in ("Glob", "Grep") else content
+        if path and tool.category in ("read", "write") and tool.work_dir:
+            path = str(tool.resolve_path(str(path)))
 
         # Explicit rules take precedence over automatic command approval.
         rule_result = self.rule_engine.evaluate(tool.name, content)
@@ -114,7 +149,7 @@ class PermissionChecker:
         # 内核级隔离会阻止越权写入，无需再弹确认。
         # 拆分复合命令逐条检查，防止通过命令拼接绕过权限检查，
         # deny 规则和 ask 规则不受沙箱影响。
-        if self.sandbox_enabled and tool.category == "command":
+        if self.sandbox_enabled and tool.name == "Bash" and tool.category == "command":
             import re
             subcommands = [s.strip() for s in re.split(r'\s*(?:&&|\|\||[;|])\s*', content) if s.strip()]
             if not subcommands:

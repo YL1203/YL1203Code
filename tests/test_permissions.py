@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import subprocess
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -490,9 +491,10 @@ async def test_e2e_sandbox_outside_path_asks():
     assert c["tool_result"][0].is_error
 
 @pytest.mark.asyncio
-async def test_e2e_rule_allows_git():
+async def test_e2e_rule_allows_git(tmp_path):
     """放行 git 命令的规则可以让其无需人工介入（HITL）直接通过。"""
-    tmpdir = Path(tempfile.mkdtemp())
+    tmpdir = tmp_path
+    subprocess.run(['git', 'init', str(tmpdir)], check=True, capture_output=True)
     rules_file = tmpdir / ".YL1203Code" / "permissions.yaml"
     rules_file.parent.mkdir(parents=True)
     rules_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "allow"}]))

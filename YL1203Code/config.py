@@ -47,7 +47,8 @@ class ProviderConfig:
 
     def resolve_api_key(self) -> str:
         if self.api_key:
-            return self.api_key
+            resolved = resolve_env_vars(self.api_key)
+            return "" if _ENV_VAR_RE.search(resolved) else resolved
         env_var = _ENV_KEY_MAP.get(self.protocol, "")
         return os.environ.get(env_var, "")
 
@@ -135,6 +136,13 @@ class SandboxAppConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    max_iterations: int = 40
+    max_total_tokens: int = 0
+    timeout_seconds: int = 0
+
+
+@dataclass
 class AppConfig:
     providers: list[ProviderConfig]
     permission_mode: str = "default"
@@ -146,6 +154,7 @@ class AppConfig:
     teammate_mode: str = ""
     enable_coordinator_mode: bool = False
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     # Track keys present in each YAML layer so explicit false/default values
     # can override an earlier layer.
     _specified: dict[str, set[str]] = field(default_factory=dict, repr=False)
@@ -211,10 +220,12 @@ def _load_single_file(path: Path) -> AppConfig:
         teammate_mode=validated["teammate_mode"],
         enable_coordinator_mode=validated["enable_coordinator_mode"],
         sandbox=sandbox_cfg,
+        execution=ExecutionConfig(**validated["execution"]),
         _specified={
             "top": set(raw),
             "worktree": set(raw.get("worktree") or {}),
             "sandbox": set(raw.get("sandbox") or {}),
+            "execution": set(raw.get("execution") or {}),
         },
     )
 
@@ -247,6 +258,8 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
         setattr(base.worktree, key, getattr(override.worktree, key))
     for key in override._specified.get("sandbox", set()):
         setattr(base.sandbox, key, getattr(override.sandbox, key))
+    for key in override._specified.get("execution", set()):
+        setattr(base.execution, key, getattr(override.execution, key))
     return base
 
 

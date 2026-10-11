@@ -38,10 +38,9 @@ class EditFile(Tool):
 
 
     async def execute(self, params: Params) -> ToolResult:
+        path = self.resolve_path(params.file_path)
         if self.file_history is not None:
-            self.file_history.track_edit(params.file_path)
-
-        path = Path(params.file_path)
+            self.file_history.track_edit(str(path))
         if not path.exists():
             return ToolResult(output=f"Error: file not found: {params.file_path}", is_error=True)
 

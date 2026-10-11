@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from YL1203Code.hooks.conditions import ConditionGroup
 
@@ -56,6 +56,10 @@ class HookContext:
     file_path: str = ""
     message: str = ""
     error: str = ""
+    work_dir: str | None = None
+    agent_runner: Callable[[str], Awaitable[ActionResult]] | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def get_field(self, name: str) -> str:
         if name == "tool":

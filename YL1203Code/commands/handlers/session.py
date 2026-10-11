@@ -75,7 +75,16 @@ async def handle_session(ctx: CommandContext) -> None:
         ctx.config["set_conversation"](conv)
         if ctx.agent:
             ctx.agent._loop_count = 0
+            ctx.agent.clear_active_skills()
+            from YL1203Code.filehistory import FileHistory
+
+            history = FileHistory(ctx.agent.work_dir, result.session.session_id)
+            ctx.agent.file_history = history
+            for tool in ctx.agent.registry.list_tools():
+                if hasattr(tool, "file_history"):
+                    tool.file_history = history
         await ctx.config["render_restored"](result.messages)
+        ctx.ui.refresh_status()
         ctx.ui.add_system_message(
             f"会话已恢复: {session_id} ({result.session.meta.message_count} msgs)"
         )

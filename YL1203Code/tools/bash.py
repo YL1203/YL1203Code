@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shlex
+import sys
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from YL1203Code.tools.base import Tool, ToolResult
+from YL1203Code.tools.processes import await_cleanup, process_group_options, terminate_process_tree
 
 if TYPE_CHECKING:
     from YL1203Code.sandbox import Sandbox, SandboxConfig
 
 MAX_TIMEOUT = 600
+log = logging.getLogger(__name__)
 
 # 特殊命令的退出码语义映射
 # 这些命令的 exit code 1 不代表错误，只有 >= 阈值才算真正的错误
@@ -128,21 +132,42 @@ class Bash(Tool):
 
         # 如果启用了 OS 沙箱，将命令包装为沙箱内执行
         actual_command = params.command
-        if self.sandbox and self.sandbox_config and self.sandbox.available():
-            actual_command = self.sandbox.wrap(params.command, self.sandbox_config)
-
+        args = None
         try:
-            proc = await asyncio.create_subprocess_shell(
-                actual_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,  # 合并 stderr 到 stdout
-                cwd=self.work_dir,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if self.sandbox:
+                if self.sandbox_config is None or not await asyncio.to_thread(self.sandbox.available):
+                    return ToolResult("Error: configured command sandbox is unavailable; command was not run", True)
+                args = self.sandbox.execution_args(params.command, self.sandbox_config, self.work_dir or ".")
+                if args is None:
+                    actual_command = self.sandbox.wrap(params.command, self.sandbox_config)
+            try:
+                options = dict(stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                               cwd=self.work_dir, **process_group_options())
+                if args is not None:
+                    proc = await asyncio.create_subprocess_exec(*args, **options)
+                else:
+                    proc = await asyncio.create_subprocess_shell(actual_command, **options)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            finally:
+                process = locals().get("proc")
+                async def cleanup() -> None:
+                    try:
+                        if process is not None and getattr(process, "returncode", None) is None:
+                            await terminate_process_tree(process)
+                    finally:
+                        if self.sandbox:
+                            await self.sandbox.cleanup(args)
+                active_error = sys.exc_info()[1]
+                try:
+                    await await_cleanup(cleanup())
+                except Exception:
+                    if active_error is None:
+                        raise
+                    log.exception("Command resource cleanup failed")
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
             return ToolResult(output=f"Error: command timed out after {timeout}s", is_error=True)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return ToolResult(output=f"Error executing command: {e}", is_error=True)
 
@@ -162,4 +187,5 @@ class Bash(Tool):
         if not output:
             output = "(no output)"
 
-        return ToolResult(output=output, is_error=_interpret_exit_code(params.command, exit_code))
+        return ToolResult(output=output, is_error=_interpret_exit_code(params.command, exit_code),
+                          exit_code=exit_code)

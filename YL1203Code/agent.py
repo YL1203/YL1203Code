@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 import uuid
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -105,6 +107,15 @@ class TurnComplete:
 @dataclass
 class LoopComplete:
     total_turns: int
+    stop_reason: str = "end_turn"
+
+
+class ExecutionLimitError(RuntimeError):
+    """A task stopped before completion because its execution budget ran out."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass
@@ -324,13 +335,27 @@ class Agent:
         instructions_content: str = "",
         memory_manager: MemoryManager | None = None,
         hook_engine: HookEngine | None = None,
+        max_total_tokens: int = 0,
+        timeout_seconds: float = 0,
     ) -> None:
         self.client = client
         self.registry = registry
         self.protocol = protocol
-        self.work_dir = work_dir
+        self._work_dir = str(Path(work_dir).resolve())
         self.max_iterations = max_iterations
+        self.max_total_tokens = max_total_tokens
+        self.timeout_seconds = timeout_seconds
         self.permission_checker = permission_checker
+        self.registry.bind_work_dir(
+            self._work_dir, lambda path: setattr(self, "work_dir", path),
+        )
+        for tool in self.registry.list_tools():
+            for owner_attr in ("_agent", "_parent_agent"):
+                owner = getattr(tool, owner_attr, None)
+                if owner is not None and owner is not self:
+                    tool = copy.copy(tool)
+                    setattr(tool, owner_attr, self)
+                    self.registry.register(tool)
         self.permission_mode: PermissionMode = (
             permission_checker.mode if permission_checker else PermissionMode.DEFAULT
         )
@@ -374,6 +399,22 @@ class Agent:
         # 非阻塞 memory recall：prefetch task 与主 LLM 调用并行，工具执行后注入
         self.memory_recall_task: Any | None = None
         self._memory_recall_consumed: bool = False
+
+    @property
+    def work_dir(self) -> str:
+        return self._work_dir
+
+    @work_dir.setter
+    def work_dir(self, value: str) -> None:
+        previous_dir = self._work_dir
+        self._work_dir = str(Path(value).resolve())
+        if self.permission_checker:
+            self.permission_checker.rebind_work_dir(previous_dir, self._work_dir)
+        self.registry.bind_work_dir(
+            self._work_dir, lambda path: setattr(self, "work_dir", path),
+        )
+        self.session_dir = ensure_session_dir(self._work_dir)
+        self._plan_path_cache = None
 
     @property
     def _transcript_path(self) -> str:
@@ -433,7 +474,41 @@ class Agent:
             file_path=str(kwargs.get("file_path", "")),
             message=str(kwargs.get("message", "")),
             error=str(kwargs.get("error", "")),
+            work_dir=self.work_dir,
+            agent_runner=self._run_hook_agent,
         )
+
+    async def _run_hook_agent(self, prompt: str):
+        """Run bounded, read-only hook inspection without invoking hooks again."""
+        from YL1203Code.hooks.models import ActionResult
+
+        registry = self.registry.copy()
+        for tool in registry.list_tools():
+            if tool.name not in {"ReadFile", "Glob", "Grep"}:
+                registry.disable(tool.name)
+        checker = self.permission_checker
+        child = Agent(
+            self.client, registry, self.protocol, work_dir=self.work_dir,
+            max_iterations=5, permission_checker=checker.copy() if checker else None,
+            max_total_tokens=self.max_total_tokens, timeout_seconds=self.timeout_seconds,
+            context_window=self.context_window, instructions_content=self.instructions_content,
+        )
+        conversation = ConversationManager()
+        conversation.add_user_message(prompt)
+        output: list[str] = []
+        errors: list[str] = []
+        async for event in child.run(conversation):
+            if isinstance(event, StreamText):
+                output.append(event.text)
+            elif isinstance(event, ErrorEvent):
+                errors.append(event.message)
+            elif isinstance(event, ToolResultEvent) and event.is_error:
+                errors.append(event.output)
+            elif isinstance(event, PermissionRequest) and not event.future.done():
+                event.future.set_result(PermissionResponse.DENY)
+        if errors:
+            return ActionResult(output="\n".join(errors), success=False)
+        return ActionResult(output="".join(output), success=True)
 
     def _infer_file_path(self, args: dict) -> str:
         return str(args.get("file_path", args.get("path", "")))
@@ -451,11 +526,58 @@ class Agent:
             for n in self.hook_engine.drain_notifications()
         ]
 
-    async def run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
-        self._current_conversation = conversation
-        env_context = build_environment_context(
-            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
+    def _environment_context(self) -> str:
+        context = build_environment_context(
+            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog,
         )
+        bash = self.registry.get("Bash")
+        backend = getattr(bash, "sandbox", None)
+        if getattr(backend, "command_platform", None) == "linux":
+            context += (
+                "\nBash execution: Linux container, /bin/bash; working directory /workspace. "
+                "Use Linux commands and project-relative paths in Bash. Host executables and "
+                "Windows absolute paths are unavailable. File tools still use the host project paths."
+            )
+        return context
+
+    async def run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
+        turns = 0
+        finished = False
+        try:
+            async with asyncio.timeout(self.timeout_seconds or None):
+                async with aclosing(self._run_events(conversation)) as events:
+                    async for event in events:
+                        if isinstance(event, TurnComplete):
+                            turns = event.turn
+                        elif isinstance(event, LoopComplete):
+                            finished = True
+                        yield event
+        except ExecutionLimitError as exc:
+            yield ErrorEvent(str(exc))
+            yield LoopComplete(turns, stop_reason=exc.reason)
+            return
+        except TimeoutError:
+            yield ErrorEvent("Agent task time limit reached")
+            yield LoopComplete(turns, stop_reason="timeout")
+            return
+        if not finished:
+            yield LoopComplete(turns, stop_reason="error")
+
+    def _check_execution_budget(self, iteration: int, initial_tokens: int) -> None:
+        if self.max_iterations > 0 and iteration > self.max_iterations:
+            raise ExecutionLimitError(
+                "iteration_limit", f"Agent reached maximum iterations limit ({self.max_iterations})",
+            )
+        used = self.total_input_tokens + self.total_output_tokens - initial_tokens
+        if self.max_total_tokens > 0 and used >= self.max_total_tokens:
+            raise ExecutionLimitError(
+                "token_limit", f"Agent token limit reached ({self.max_total_tokens})",
+            )
+
+    async def _run_events(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
+        initial_tokens = self.total_input_tokens + self.total_output_tokens
+        self._current_conversation = conversation
+        env_context = self._environment_context()
         conversation.inject_environment(env_context)
 
         memory_content = self.memory_manager.load() if self.memory_manager else ""
@@ -475,11 +597,7 @@ class Agent:
         while True:
             iteration += 1
 
-            if self.max_iterations > 0 and iteration > self.max_iterations:
-                yield ErrorEvent(
-                    message=f"Agent reached maximum iterations ({self.max_iterations})"
-                )
-                break
+            self._check_execution_budget(iteration, initial_tokens)
 
             if self.hook_engine:
                 ctx = self._build_hook_context("turn_start")
@@ -986,6 +1104,7 @@ class Agent:
         path = tc.arguments.get("file_path") if isinstance(tc.arguments, dict) else None
         if not path:
             return
+        path = str(self.registry.get("ReadFile").resolve_path(path))
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
@@ -1047,9 +1166,7 @@ class Agent:
             transcript_path=self._transcript_path,
         )
         if isinstance(result, CompactEvent):
-            env_context = build_environment_context(
-            self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
-        )
+            env_context = self._environment_context()
             conversation.inject_environment(env_context)
             memory_content = self.memory_manager.load() if self.memory_manager else ""
             conversation.inject_long_term_memory(
@@ -1066,12 +1183,21 @@ class Agent:
         self, task: str, conversation: ConversationManager | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        try:
+            async with asyncio.timeout(self.timeout_seconds or None):
+                return await self._run_to_completion(task, conversation, event_callback)
+        except TimeoutError as exc:
+            raise ExecutionLimitError("timeout", "Agent task time limit reached") from exc
+
+    async def _run_to_completion(
+        self, task: str, conversation: ConversationManager | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        initial_tokens = self.total_input_tokens + self.total_output_tokens
         if conversation is None:
             conversation = ConversationManager()
 
-            env_context = build_environment_context(
-                self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
-            )
+            env_context = self._environment_context()
             conversation.inject_environment(env_context)
 
             if self.instructions_content:
@@ -1082,6 +1208,7 @@ class Agent:
 
         if task:
             conversation.add_user_message(task)
+        self._current_conversation = conversation
 
         hook_prompts = (
             self.hook_engine.get_prompt_messages() if self.hook_engine else None
@@ -1106,8 +1233,7 @@ class Agent:
         iteration = 0
         while True:
             iteration += 1
-            if self.max_iterations > 0 and iteration > self.max_iterations:
-                break
+            self._check_execution_budget(iteration, initial_tokens)
             if self.hook_engine:
                 ctx = self._build_hook_context("turn_start")
                 await self.hook_engine.run_hooks("turn_start", ctx)
@@ -1188,6 +1314,8 @@ class Agent:
 
             if not response.tool_calls:
                 conversation.add_assistant_message(response.text)
+                if event_callback:
+                    event_callback({"type": "turn_complete", "turn": iteration})
                 if self.file_history is not None:
                     summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
                     self.file_history.make_snapshot(len(conversation.history), summary)
@@ -1212,6 +1340,7 @@ class Agent:
             )
 
             tool_results: list[ToolResultBlock] = []
+            results_message = None
             for tc in response.tool_calls:
                 if event_callback:
                     event_callback({
@@ -1228,8 +1357,16 @@ class Agent:
                         is_error=result.is_error,
                     )
                 )
-
-            conversation.add_tool_results_message(tool_results)
+                if results_message is None:
+                    conversation.add_tool_results_message([tool_results[-1]])
+                    results_message = conversation.history[-1]
+                else:
+                    results_message.tool_results.append(tool_results[-1])
+                if event_callback:
+                    event_callback({
+                        "type": "tool_result", "toolName": tc.tool_name,
+                        "output": content, "is_error": result.is_error,
+                    })
 
             if self.hook_engine:
                 ctx = self._build_hook_context("turn_end")
@@ -1261,13 +1398,10 @@ class Agent:
                     is_error=True,
                 )
             if decision.effect == "ask":
-                if self.permission_mode == PermissionMode.BYPASS:
-                    pass  # BYPASS 模式自动批准
-                else:
-                    return ToolResult(
-                        output="Permission denied: non-interactive agent cannot prompt user",
-                        is_error=True,
-                    )
+                return ToolResult(
+                    output="Permission denied: non-interactive agent cannot prompt user",
+                    is_error=True,
+                )
 
         return await self._invoke_tool(tc, tool)
 

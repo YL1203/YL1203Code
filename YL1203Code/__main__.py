@@ -51,7 +51,34 @@ def main() -> None:
         default=False,
         help="Start in remote mode: WebSocket server on 127.0.0.1:18888 with browser UI",
     )
+    parser.add_argument("--doctor", action="store_true", help="Check configuration, tools and local proxy ports")
+    parser.add_argument("--init", action="store_true", help="Create local configuration using a short wizard")
+    parser.add_argument("--protocol", choices=["anthropic", "openai", "openai-compat"])
+    parser.add_argument("--base-url")
+    parser.add_argument("--model")
     args = parser.parse_args()
+
+    if args.init:
+        from YL1203Code.onboarding import write_initial_config
+        protocol = args.protocol or input("协议 [anthropic/openai/openai-compat]: ").strip()
+        base_url = args.base_url or input("API 地址: ").strip()
+        model = args.model or input("模型名称: ").strip()
+        try:
+            path = write_initial_config(os.getcwd(), protocol=protocol, base_url=base_url, model=model)
+            print(f"配置已创建: {path}。请通过环境变量设置 API Key，再运行 --doctor。")
+        except (OSError, ValueError) as exc:
+            print(f"初始化失败: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.doctor:
+        from YL1203Code.onboarding import doctor_report
+        try:
+            doctor_config = load_config()
+        except ConfigError:
+            doctor_config = None
+        print("\n".join(doctor_report(os.getcwd(), doctor_config)))
+        return
 
     try:
         config = load_config()
@@ -72,7 +99,9 @@ def main() -> None:
 
     if args.p is not None:
         output_format = getattr(args, "output_format", "text")
-        asyncio.run(_run_prompt(config, permission_mode, hook_engine, args.p, output_format))
+        failed = asyncio.run(_run_prompt(config, permission_mode, hook_engine, args.p, output_format))
+        if failed:
+            sys.exit(1)
         return
 
     # Remote 模式：启动 WebSocket 服务器，浏览器访问 http://localhost:18888
@@ -84,6 +113,7 @@ def main() -> None:
             mcp_servers=config.mcp_servers,
             hook_engine=hook_engine,
             permission_mode=permission_mode,
+            config=config,
         )
         asyncio.run(server.run())
         return
@@ -103,281 +133,156 @@ def main() -> None:
         enable_coordinator_mode=config.enable_coordinator_mode,
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
+        execution_config=config.execution,
     )
     app.run()
 
 
-async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_format: str = "text") -> None:
+async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_format: str = 'text') -> bool:
+    from contextlib import aclosing
     from YL1203Code.agent import (
-        Agent,
-        CompactNotification,
-        ErrorEvent,
-        LoopComplete,
-        PermissionRequest,
-        PermissionResponse,
-        RetryEvent,
-        StreamText,
-        ThinkingText,
-        ToolResultEvent,
-        ToolUseEvent,
-        TurnComplete,
-        UsageEvent,
+        CompactNotification, ErrorEvent, LoopComplete, PermissionRequest,
+        PermissionResponse, RetryEvent, StreamText, ThinkingText, ToolResultEvent,
+        ToolUseEvent, TurnComplete, UsageEvent,
     )
     from YL1203Code.client import create_client, resolve_context_window
     from YL1203Code.conversation import ConversationManager
-    from YL1203Code.memory.instructions import load_instructions
-    from YL1203Code.permissions import (
-        DangerousCommandDetector,
-        PathSandbox,
-        PermissionChecker,
-        RuleEngine,
-    )
-    from YL1203Code.tools import create_default_registry
-    from YL1203Code.agents.loader import AgentLoader
-    from YL1203Code.agents.task_manager import TaskManager
-    from YL1203Code.agents.trace import TraceManager
-    from YL1203Code.tools.agent_tool import AgentTool
-    from YL1203Code.tools.impl.tool_search import ToolSearchTool
     from YL1203Code.mcp import MCPManager
-    from YL1203Code.teams.manager import TeamManager
-    from YL1203Code.teams.models import BackendType
-    from YL1203Code.tools.team_create import TeamCreateTool
-    from YL1203Code.tools.team_delete import TeamDeleteTool
-    from YL1203Code.worktree import WorktreeManager
-    from YL1203Code.config import WorktreeConfig
+    from YL1203Code.runtime import create_runtime
 
-    is_json = output_format == "stream-json"
-
+    is_json = output_format == 'stream-json'
     def emit_json(obj: dict) -> None:
-        """输出一行 NDJSON 到 stdout"""
         print(json.dumps(obj, ensure_ascii=False), flush=True)
 
     provider = config.providers[0]
     client = create_client(provider)
-    # 第 2 层：尽力从 provider 自动拉取模型的 context window（缓存在 provider 上）。
-    # 不会抛异常或阻塞启动；失败则退化到映射表。
     await resolve_context_window(provider)
-    work_dir = os.getcwd()
-    home = Path.home()
-
-    checker = PermissionChecker(
-        detector=DangerousCommandDetector(),
-        sandbox=PathSandbox(work_dir),
-        rule_engine=RuleEngine(
-            user_rules_path=home / ".YL1203Code" / "permissions.yaml",
-            project_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.yaml",
-            local_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.local.yaml",
-        ),
-        mode=permission_mode,
-    )
-
-    instructions = load_instructions(work_dir)
-    registry = create_default_registry()
-    registry.register(ToolSearchTool(registry, protocol=provider.protocol))
+    runtime = create_runtime(config, permission_mode, os.getcwd(), client=client, hook_engine=hook_engine)
+    agent = runtime.agent
     mcp_manager = None
-    mcp_instructions: list[str] = []
-    if config.mcp_servers:
-        mcp_manager = MCPManager()
-        mcp_manager.load_configs(config.mcp_servers)
-        connected = await mcp_manager.register_all_tools(registry)
-        for error in connected.errors:
-            print(error, file=sys.stderr, flush=True)
-        mcp_instructions = [
-            f"## {server.name}\n{server.instructions}"
-            for server in connected.servers if server.instructions
-        ]
-
-    agent = Agent(
-        client=client,
-        registry=registry,
-        protocol=provider.protocol,
-        work_dir=work_dir,
-        permission_checker=checker,
-        context_window=provider.get_context_window(),
-        instructions_content=instructions,
-        hook_engine=hook_engine,
-    )
-
-    wt_cfg = config.worktree or WorktreeConfig()
-    wt_manager = WorktreeManager(
-        repo_root=work_dir,
-        symlink_directories=wt_cfg.symlink_directories,
-    )
-    trace_manager = TraceManager()
-    task_manager = TaskManager()
-    agent_loader = AgentLoader(work_dir, enable_verification=config.enable_verification_agent)
-    agent_loader.load_all()
-    team_manager = TeamManager(worktree_manager=wt_manager, trace_manager=trace_manager)
-
-    agent_tool = AgentTool(
-        agent_loader=agent_loader,
-        task_manager=task_manager,
-        trace_manager=trace_manager,
-        parent_agent=agent,
-        enable_fork=config.enable_fork,
-        provider_config=provider,
-        worktree_manager=wt_manager,
-        team_manager=team_manager,
-    )
-    registry.register(agent_tool)
-    registry.register(TeamCreateTool(
-        team_manager=team_manager,
-        parent_agent=agent,
-        teammate_mode="in-process",
-        is_interactive=False,
-        enable_coordinator_mode=config.enable_coordinator_mode,
-    ))
-    registry.register(TeamDeleteTool(team_manager=team_manager, parent_agent=agent))
-
-    def drain_notifications() -> list[str]:
-        notes: list[str] = []
-        for t in task_manager.poll_completed():
-            notes.append(
-                f"<task-notification>\n<task_id>{t.id}</task_id>\n"
-                f"<status>{t.status}</status>\n<result>{t.result}</result>\n"
-                f"</task-notification>"
-            )
-        notes.extend(team_manager.drain_lead_mailbox())
-        return notes
-
-    def drain_mailbox_only() -> list[str]:
-        return team_manager.drain_lead_mailbox()
-
-    agent.notification_fn = drain_mailbox_only
-
-    # 使用事件驱动的 agent.run()，支持 text 和 stream-json 两种输出格式
     conv = ConversationManager()
     conv.add_user_message(prompt)
-    if mcp_instructions:
-        conv.add_system_reminder(
-            "# MCP Server Instructions\n\n" + "\n\n".join(mcp_instructions)
-        )
-
     start = time.monotonic()
-    text_buf = ""
-    total_input = 0
-    total_output = 0
+    text_buf = ''
     tool_calls: list[dict] = []
+    failed = False
+    stop_reason = 'end_turn'
+    total_turns = 0
 
-    async for event in agent.run(conv):
-        if isinstance(event, StreamText):
-            text_buf += event.text
-            if is_json:
-                emit_json({"type": "assistant", "text": event.text})
+    async def consume_run() -> None:
+        nonlocal text_buf, failed, stop_reason, total_turns
+        async with aclosing(agent.run(conv)) as stream:
+            async for event in stream:
+                if isinstance(event, StreamText):
+                    text_buf += event.text
+                    if is_json:
+                        emit_json({'type': 'assistant', 'text': event.text})
+                elif isinstance(event, ThinkingText) and is_json:
+                    emit_json({'type': 'thinking', 'text': event.text})
+                elif isinstance(event, ToolUseEvent):
+                    tool_calls.append({'id': event.tool_id, 'name': event.tool_name, 'is_error': False})
+                    if is_json:
+                        emit_json({'type': 'tool_use', 'tool_name': event.tool_name,
+                                   'tool_id': event.tool_id, 'args': event.arguments})
+                elif isinstance(event, ToolResultEvent):
+                    for call in tool_calls:
+                        if call['id'] == event.tool_id:
+                            call['is_error'] = event.is_error
+                    if is_json:
+                        emit_json({'type': 'tool_result', 'tool_name': event.tool_name,
+                                   'tool_id': event.tool_id, 'output': event.output,
+                                   'is_error': event.is_error, 'elapsed': round(event.elapsed, 3)})
+                elif isinstance(event, UsageEvent) and is_json:
+                    emit_json({'type': 'usage', 'input_tokens': event.input_tokens,
+                               'output_tokens': event.output_tokens})
+                elif isinstance(event, TurnComplete) and is_json:
+                    emit_json({'type': 'turn_complete', 'turn': event.turn})
+                elif isinstance(event, LoopComplete):
+                    total_turns += event.total_turns
+                    stop_reason = event.stop_reason
+                    failed |= stop_reason != 'end_turn'
+                elif isinstance(event, ErrorEvent):
+                    failed = True
+                    if is_json:
+                        emit_json({'type': 'error', 'message': event.message})
+                    else:
+                        print(f'Error: {event.message}', file=sys.stderr, flush=True)
+                elif isinstance(event, CompactNotification) and is_json:
+                    emit_json({'type': 'compact', 'message': event.message})
+                elif isinstance(event, RetryEvent) and is_json:
+                    emit_json({'type': 'retry', 'reason': event.reason})
+                elif isinstance(event, PermissionRequest) and not event.future.done():
+                    event.future.set_result(PermissionResponse.DENY)
 
-        elif isinstance(event, ThinkingText):
-            if is_json:
-                emit_json({"type": "thinking", "text": event.text})
-
-        elif isinstance(event, ToolUseEvent):
-            tool_calls.append({"name": event.tool_name, "is_error": False})
-            if is_json:
-                emit_json({
-                    "type": "tool_use",
-                    "tool_name": event.tool_name,
-                    "tool_id": event.tool_id,
-                    "args": event.arguments,
-                })
-
-        elif isinstance(event, ToolResultEvent):
-            # 回填最后一个同名 tool_call 的 is_error
-            if tool_calls:
-                tool_calls[-1]["is_error"] = event.is_error
-            if is_json:
-                emit_json({
-                    "type": "tool_result",
-                    "tool_name": event.tool_name,
-                    "tool_id": event.tool_id,
-                    "output": event.output,
-                    "is_error": event.is_error,
-                    "elapsed": round(event.elapsed, 3),
-                })
-
-        elif isinstance(event, UsageEvent):
-            total_input = event.input_tokens
-            total_output = event.output_tokens
-            if is_json:
-                emit_json({
-                    "type": "usage",
-                    "input_tokens": event.input_tokens,
-                    "output_tokens": event.output_tokens,
-                })
-
-        elif isinstance(event, TurnComplete):
-            if is_json:
-                emit_json({"type": "turn_complete", "turn": event.turn})
-
-        elif isinstance(event, LoopComplete):
-            # 最终结果：stream-json 输出 result 行，text 模式直接打印文本
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            if is_json:
-                emit_json({
-                    "type": "result",
-                    "result": text_buf,
-                    "duration_ms": elapsed_ms,
-                    "num_turns": event.total_turns,
-                    "tool_calls": tool_calls,
-                    "usage": {
-                        "input_tokens": total_input,
-                        "output_tokens": total_output,
-                    },
-                    "stop_reason": "end_turn",
-                })
-            else:
-                print(text_buf, end="", flush=True)
-            break
-
-        elif isinstance(event, ErrorEvent):
-            if is_json:
-                emit_json({"type": "error", "message": event.message})
-            else:
-                print(f"Error: {event.message}", file=sys.stderr, flush=True)
-
-        elif isinstance(event, CompactNotification):
-            if is_json:
-                emit_json({"type": "compact", "message": event.message})
-
-        elif isinstance(event, RetryEvent):
-            if is_json:
-                emit_json({"type": "retry", "reason": event.reason})
-
-        elif isinstance(event, PermissionRequest):
-            # Non-interactive runs cannot ask for consent. Explicit bypass
-            # mode is required for unattended operations needing approval.
-            event.future.set_result(PermissionResponse.DENY)
-
-    # 如果有 team 在运行，轮询等待 teammate 完成
-    if not team_manager._teams:
-        if mcp_manager is not None:
-            await mcp_manager.shutdown()
-        return
-
-    for i in range(90):
-        await asyncio.sleep(2)
-        running = {k: not t.done() for k, t in task_manager._async_tasks.items()}
-        completed_ids = [t.id for t in task_manager._tasks.values() if t.status != "running"]
-        print(f"[poll {i}] running={running} completed={completed_ids} teams={list(team_manager._teams.keys())} queue_size={task_manager._notify_queue.qsize()}", file=sys.stderr, flush=True)
-        notes = drain_notifications()
-        if not notes:
-            has_running = any(v for v in running.values())
-            if not has_running:
-                print(f"[poll {i}] no running tasks, breaking", file=sys.stderr, flush=True)
-                break
-            continue
-        for note in notes:
-            conv.add_system_reminder(note)
-        # 后续 team 轮询仍用 run_to_completion，避免重复事件循环
-        last_result = await agent.run_to_completion(
-            "Teammate notifications received. Process them and continue.", conv
-        )
+    try:
+        for warning in runtime.warnings:
+            print(warning, file=sys.stderr)
+        async with asyncio.timeout(config.execution.timeout_seconds or None):
+            if config.mcp_servers:
+                mcp_manager = MCPManager()
+                mcp_manager.load_configs(config.mcp_servers)
+                connected = await mcp_manager.register_all_tools(runtime.registry)
+                for error in connected.errors:
+                    print(error, file=sys.stderr, flush=True)
+                instructions = [f'## {server.name}\n{server.instructions}'
+                                for server in connected.servers if server.instructions]
+                if instructions:
+                    conv.add_system_reminder('# MCP Server Instructions\n\n' + '\n\n'.join(instructions))
+            # During the foreground run, include ordinary background task results too.
+            drain = agent.notification_fn
+            await consume_run()
+            deadline = time.monotonic() + 180
+            while not failed:
+                notes = drain() if drain else []
+                if notes:
+                    for note in notes:
+                        conv.add_system_reminder(note)
+                    await consume_run()
+                    continue
+                if not any(task.status == 'running' for task in runtime.task_manager.list_tasks()):
+                    break
+                if time.monotonic() >= deadline:
+                    failed = True
+                    stop_reason = 'background_timeout'
+                    break
+                await asyncio.sleep(.1)
+            if any(task.status == 'failed' for task in runtime.task_manager.list_tasks()):
+                failed = True
+                stop_reason = 'background_error'
+    except TimeoutError:
+        failed, stop_reason = True, 'timeout'
         if is_json:
-            emit_json({"type": "assistant", "text": last_result})
+            emit_json({'type': 'error', 'message': 'Request time limit reached'})
         else:
-            print(last_result, flush=True)
+            print('Error: Request time limit reached', file=sys.stderr)
+    except Exception as exc:
+        failed, stop_reason = True, 'error'
+        if is_json:
+            emit_json({'type': 'error', 'message': str(exc)})
+        else:
+            print(f'Error: {exc}', file=sys.stderr)
+    finally:
+        try:
+            for message in conv.history:
+                runtime.session.append(message)
+        finally:
+            try:
+                await runtime.close()
+            finally:
+                if mcp_manager is not None:
+                    await mcp_manager.shutdown()
 
-    if mcp_manager is not None:
-        await mcp_manager.shutdown()
+    if is_json:
+        emit_json({'type': 'result', 'result': text_buf,
+                   'duration_ms': int((time.monotonic() - start) * 1000),
+                   'num_turns': total_turns, 'tool_calls': tool_calls,
+                   'usage': {'input_tokens': agent.total_input_tokens,
+                             'output_tokens': agent.total_output_tokens},
+                   'stop_reason': stop_reason, 'success': not failed})
+    else:
+        print(text_buf, end='', flush=True)
+    return failed
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

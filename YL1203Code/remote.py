@@ -14,12 +14,11 @@ import json
 import logging
 import os
 import time
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import websockets
-from websockets.asyncio.server import Server as WSServer, ServerConnection
+from websockets.asyncio.server import ServerConnection
 from websockets.http11 import Request, Response
 
 from YL1203Code.agent import (
@@ -38,27 +37,19 @@ from YL1203Code.agent import (
     TurnComplete,
     UsageEvent,
 )
-from YL1203Code.client import create_client, resolve_context_window
+from YL1203Code.client import create_client
 from YL1203Code.commands import CommandContext, CommandRegistry, CommandType
 from YL1203Code.commands.handlers import register_all_commands
 from YL1203Code.commands.parser import parse_command
-from YL1203Code.config import MCPServerConfig, ProviderConfig
+from YL1203Code.config import AppConfig, MCPServerConfig, ProviderConfig
 from YL1203Code.conversation import ConversationManager
 from YL1203Code.hooks import HookEngine
 from YL1203Code.mcp import MCPManager
-from YL1203Code.memory import MemoryManager, load_instructions
+from YL1203Code.memory import MemoryManager
 from YL1203Code.memory.session import Session, SessionManager
-from YL1203Code.permissions import (
-    DangerousCommandDetector,
-    PathSandbox,
-    PermissionChecker,
-    PermissionMode,
-    RuleEngine,
-)
+from YL1203Code.permissions import PermissionMode
 from YL1203Code.skills.loader import SkillLoader
-from YL1203Code.tools import ToolRegistry, create_default_registry
-from YL1203Code.tools.impl.tool_search import ToolSearchTool
-from YL1203Code.tools.load_skill import LoadSkill
+from YL1203Code.tools import ToolRegistry
 from YL1203Code.web_content import INDEX_HTML
 
 log = logging.getLogger(__name__)
@@ -75,8 +66,11 @@ class RemoteServer:
         permission_mode: PermissionMode = PermissionMode.DEFAULT,
         addr: str = "127.0.0.1",
         port: int = 18888,
+        config: AppConfig | None = None,
     ) -> None:
         self.providers = providers
+        self.config = config or AppConfig(providers, mcp_servers=mcp_servers or [])
+        self._runtime = None
         self._mcp_server_configs = mcp_servers or []
         self.hook_engine = hook_engine
         self.permission_mode = permission_mode
@@ -94,6 +88,7 @@ class RemoteServer:
         self._streaming = False
         self._cancel_event: asyncio.Event | None = None
         self._active_task: asyncio.Task[None] | None = None
+        self._notification_task: asyncio.Task[None] | None = None
 
         # 权限请求的 pending 队列：id -> Future
         self._pending_perms: dict[str, asyncio.Future[PermissionResponse]] = {}
@@ -122,14 +117,12 @@ class RemoteServer:
         """启动 HTTP + WebSocket 服务器。"""
         # 初始化 Agent
         self._init_agent()
-
-        # 初始化 MCP（如果有配置）
-        await self._init_mcp()
-
-        print(f"\n  Remote UI: http://localhost:{self.port}\n")
+        self._notification_task = asyncio.create_task(self._poll_task_notifications())
 
         # websockets 的 serve 支持 process_request 回调来处理普通 HTTP
         try:
+            await self._init_mcp()
+            print(f"\n  Remote UI: http://localhost:{self.port}\n")
             async with websockets.serve(
                 self._ws_handler,
                 self.addr,
@@ -140,8 +133,25 @@ class RemoteServer:
                 # 服务器启动后永久阻塞
                 await asyncio.Future()
         finally:
+            if self._active_task and not self._active_task.done():
+                self._active_task.cancel()
+                await asyncio.gather(self._active_task, return_exceptions=True)
+            if self._notification_task:
+                self._notification_task.cancel()
+                await asyncio.gather(self._notification_task, return_exceptions=True)
             if self.mcp_manager is not None:
                 await self.mcp_manager.shutdown()
+            if self._runtime is not None:
+                await self._runtime.close()
+
+    async def _poll_task_notifications(self) -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            if self._streaming or not self.agent or not self.conversation:
+                continue
+            for note in self.agent.notification_fn() if self.agent.notification_fn else []:
+                self.conversation.add_system_reminder(note)
+                await self._broadcast({"type": "system", "data": {"message": note}})
 
     # ------------------------------------------------------------------
     # HTTP 请求处理（为 / 路径提供前端 HTML）
@@ -239,73 +249,27 @@ class RemoteServer:
 
     def _init_agent(self) -> None:
         """初始化 Agent 及相关子系统。"""
+        from YL1203Code.runtime import create_runtime, register_runtime_commands
+
         provider = self.providers[0]
-        work_dir = os.getcwd()
-        home = Path.home()
-
-        # 权限系统
-        checker = PermissionChecker(
-            detector=DangerousCommandDetector(),
-            sandbox=PathSandbox(work_dir),
-            rule_engine=RuleEngine(
-                user_rules_path=home / ".YL1203Code" / "permissions.yaml",
-                project_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.yaml",
-                local_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.local.yaml",
-            ),
-            mode=self.permission_mode,
+        runtime = create_runtime(
+            self.config, self.permission_mode, os.getcwd(),
+            client=create_client(provider), hook_engine=self.hook_engine,
+            is_interactive=True,
         )
-
-        # 加载自定义指令和记忆
-        instructions = load_instructions(work_dir)
-        self.memory_manager = MemoryManager(work_dir)
-        self.session_manager = SessionManager(work_dir)
-        self.session = self.session_manager.create()
-        self.session_id = self.session.session_id
-
-        # 创建 LLM 客户端
-        client = create_client(provider)
-
-        # 工具注册表
-        self.registry = create_default_registry()
-        self.registry.register(ToolSearchTool(self.registry, protocol=provider.protocol))
-
-        # Skill 加载
-        self.skill_loader = SkillLoader(work_dir)
-        self.skill_loader.load_all()
-        load_skill_tool = LoadSkill()
-        self.registry.register(load_skill_tool)
-
-        # 创建 Agent
-        self.agent = Agent(
-            client=client,
-            registry=self.registry,
-            protocol=provider.protocol,
-            work_dir=work_dir,
-            permission_checker=checker,
-            context_window=provider.get_context_window(),
-            instructions_content=instructions,
-            memory_manager=self.memory_manager,
-            hook_engine=self.hook_engine,
-        )
-        self.agent.session_id = self.session_id
-
-        # 连接 Skill 到 Agent
-        load_skill_tool.set_loader(self.skill_loader)
-        load_skill_tool.set_agent(self.agent)
-
-        catalog = self.skill_loader.get_catalog()
-        if catalog:
-            lines = ["You can use the following Skills:", ""]
-            for name, desc in catalog:
-                lines.append(f"- {name}: {desc}")
-            lines.append("")
-            lines.append("If the user's request matches a Skill, call LoadSkill to activate it.")
-            self.agent.set_skill_catalog("\n".join(lines))
-
-        # 初始化对话管理器
+        self._runtime = runtime
+        self.agent = runtime.agent
+        self.registry = runtime.registry
+        self.memory_manager = runtime.memory_manager
+        self.session_manager = runtime.session_manager
+        self.session = runtime.session
+        self.session_id = runtime.session.session_id
+        self.skill_loader = runtime.skill_loader
+        self.skill_executor = runtime.skill_executor
         self.conversation = ConversationManager()
-
-        log.info("Agent initialized: session=%s, model=%s", self.session_id, provider.model)
+        register_runtime_commands(runtime, self.command_registry)
+        for warning in runtime.warnings:
+            log.warning(warning)
 
     # ------------------------------------------------------------------
     # MCP 初始化
@@ -426,17 +390,7 @@ class RemoteServer:
                     })
 
                 elif isinstance(event, PermissionRequest):
-                    # 生成唯一 ID，等待 Web 端回复
-                    perm_id = f"perm_{time.time_ns()}"
-                    self._pending_perms[perm_id] = event.future
-                    await self._broadcast({
-                        "type": "permission_request",
-                        "data": {
-                            "id": perm_id,
-                            "toolName": event.tool_name,
-                            "description": event.description,
-                        },
-                    })
+                    await self._handle_permission_request(event)
 
                 elif isinstance(event, TurnComplete):
                     if stream_buf:
@@ -552,14 +506,19 @@ class RemoteServer:
 
         if cmd.type == CommandType.LOCAL:
             # 本地命令直接执行
+            self._streaming = True
             ctx = self._build_command_context(args)
             try:
                 await cmd.handler(ctx)
+            except asyncio.CancelledError:
+                await self._broadcast({"type": "system", "data": {"message": "Operation cancelled"}})
             except Exception as exc:
                 await self._broadcast({
                     "type": "error",
                     "data": {"message": f"Command error: {exc}"},
                 })
+            finally:
+                self._streaming = False
             await self._broadcast({"type": "command_done", "data": None})
 
         elif cmd.type == CommandType.LOCAL_UI:
@@ -606,6 +565,9 @@ class RemoteServer:
             ui=self,  # type: ignore[arg-type]
             config={
                 "registry": self.command_registry,
+                "skill_loader": self.skill_loader,
+                "skill_executor": self.skill_executor,
+                "permission_handler": self._handle_permission_request,
             },
         )
 
@@ -651,7 +613,8 @@ class RemoteServer:
 
     def send_user_message(self, text: str) -> None:
         """同步接口 — 注入用户消息并触发 agent。"""
-        if self._active_task is None or self._active_task.done():
+        if (not self._streaming and (self._active_task is None or self._active_task.done()
+                                    or self._active_task is asyncio.current_task())):
             self._active_task = asyncio.create_task(self._handle_user_message(text))
 
     def set_plan_mode(self, enabled: bool) -> None:
@@ -673,6 +636,16 @@ class RemoteServer:
     # ------------------------------------------------------------------
     # 权限响应处理
     # ------------------------------------------------------------------
+
+    async def _handle_permission_request(self, event: PermissionRequest) -> None:
+        perm_id = f"perm_{time.time_ns()}"
+        self._pending_perms[perm_id] = event.future
+        event.future.add_done_callback(lambda _: self._pending_perms.pop(perm_id, None))
+        await self._broadcast({
+            "type": "permission_request", "data": {
+                "id": perm_id, "toolName": event.tool_name, "description": event.description,
+            },
+        })
 
     def _handle_permission_response(self, data: dict[str, Any]) -> None:
         """处理来自 Web UI 的权限回复。"""

@@ -16,8 +16,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from YL1203Code.memory.auto_memory import ENTRYPOINT_NAME, MAX_ENTRYPOINT_LINES
 from YL1203Code.memory.session import SessionManager
+from YL1203Code.permissions.checker import Decision, PermissionChecker
+from YL1203Code.tools.base import Tool, ToolResult
+from YL1203Code.tools.file_state_cache import FileStateCache
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +31,51 @@ DEFAULT_MIN_SESSIONS = 5
 SCAN_THROTTLE_MS = 10 * 60 * 1000
 LOCK_FILE = ".consolidate-lock"
 HOLDER_STALE_MS = 60 * 60 * 1000
+
+
+class MemoryWriteChecker(PermissionChecker):
+    """Background consolidation may only change Markdown in memory roots."""
+
+    def __init__(self, *args: Any, memory_roots: list[str], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.memory_roots = [Path(root).resolve() for root in memory_roots]
+
+    def check(self, tool: Tool, arguments: dict[str, Any]) -> Decision:
+        if tool.category == "command":
+            return Decision("deny", "Memory consolidation cannot execute commands")
+        if tool.category == "write":
+            path = tool.resolve_path(str(arguments.get("file_path", ""))).resolve()
+            if path.suffix.lower() != ".md" or not any(
+                path.is_relative_to(root) for root in self.memory_roots
+            ):
+                return Decision("deny", "Memory consolidation can only write memory Markdown")
+        return super().check(tool, arguments)
+
+
+class DeleteMemoryParams(BaseModel):
+    file_path: str = Field(description="Path to an obsolete memory Markdown file")
+
+
+class DeleteMemory(Tool):
+    name = "DeleteMemory"
+    description = "Delete an obsolete memory file. Read it with ReadFile before deleting."
+    params_model = DeleteMemoryParams
+    category = "write"
+
+    def __init__(self, state_cache: FileStateCache) -> None:
+        self._state_cache = state_cache
+
+    async def execute(self, params: DeleteMemoryParams) -> ToolResult:
+        path = self.resolve_path(params.file_path)
+        ok, reason = self._state_cache.check(str(path.resolve()))
+        if not ok:
+            return ToolResult(reason, is_error=True)
+        try:
+            path.unlink()
+        except OSError as exc:
+            return ToolResult(f"Error deleting memory: {exc}", is_error=True)
+        self._state_cache.update(str(path.resolve()))
+        return ToolResult(f"Deleted memory: {params.file_path}")
 
 
 class MemoryConsolidator:
@@ -101,8 +151,11 @@ class MemoryConsolidator:
                 client, conversation, protocol, session_ids
             )
         except Exception:
-            logger.debug("[consolidation] failed, rolling back lock")
+            logger.debug("[consolidation] failed, rolling back lock", exc_info=True)
             _rollback_lock(self._mem_dir, prior_mtime)
+        except asyncio.CancelledError:
+            _rollback_lock(self._mem_dir, prior_mtime)
+            raise
 
     async def _do_consolidation(
         self,
@@ -112,15 +165,16 @@ class MemoryConsolidator:
         session_ids: list[str],
     ) -> None:
         from YL1203Code.agent import Agent
-        from YL1203Code.conversation import ConversationManager
-        from YL1203Code.permissions.checker import PermissionChecker
+        from YL1203Code.permissions.dangerous import DangerousCommandDetector
+        from YL1203Code.permissions.modes import PermissionMode
+        from YL1203Code.permissions.rules import RuleEngine
+        from YL1203Code.permissions.sandbox import PathSandbox
         from YL1203Code.tools import ToolRegistry
-        from YL1203Code.tools.bash import BashTool
-        from YL1203Code.tools.edit_file import EditFileTool
-        from YL1203Code.tools.glob import GlobTool
-        from YL1203Code.tools.grep import GrepTool
-        from YL1203Code.tools.read_file import ReadFileTool
-        from YL1203Code.tools.write_file import WriteFileTool
+        from YL1203Code.tools.edit_file import EditFile
+        from YL1203Code.tools.glob import Glob
+        from YL1203Code.tools.grep import Grep
+        from YL1203Code.tools.read_file import ReadFile
+        from YL1203Code.tools.write_file import WriteFile
 
         transcript_dir = os.path.join(self._work_dir, ".YL1203Code", "sessions")
         prompt = _build_consolidation_prompt(
@@ -129,25 +183,34 @@ class MemoryConsolidator:
 
         # 构建子 Agent 的工具注册表
         registry = ToolRegistry()
-        for tool_cls in [ReadFileTool, WriteFileTool, EditFileTool, GlobTool, GrepTool, BashTool]:
-            registry.register(tool_cls())
+        state_cache = FileStateCache()
+        for tool in [
+            ReadFile(file_state_cache=state_cache),
+            WriteFile(file_state_cache=state_cache),
+            EditFile(file_state_cache=state_cache), Glob(), Grep(),
+            DeleteMemory(state_cache),
+        ]:
+            registry.register(tool)
 
-        checker = PermissionChecker(self._work_dir, mode="bypass")
-
-        conv = ConversationManager()
-        conv.add_user_message(prompt)
+        checker = MemoryWriteChecker(
+            DangerousCommandDetector(),
+            PathSandbox(self._work_dir, extra_allowed=[self._user_mem_dir]),
+            RuleEngine(), PermissionMode.ACCEPT_EDITS,
+            memory_roots=[self._mem_dir, self._user_mem_dir],
+        )
 
         sub_agent = Agent(
             client=client,
             registry=registry,
-            checker=checker,
+            permission_checker=checker,
             work_dir=self._work_dir,
             protocol=protocol,
             max_iterations=15,
         )
 
-        async for _event in sub_agent.run(conv):
-            pass  # drain
+        # Bind the memory-specific tool too; normal file tools are bound by Agent.
+        registry.get("DeleteMemory").work_dir = sub_agent.work_dir
+        await sub_agent.run_to_completion(prompt)
 
         logger.debug("[consolidation] completed")
 
@@ -216,10 +279,31 @@ def _rollback_lock(mem_dir: str, prior_mtime: int) -> None:
 
 
 def _is_process_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) means CTRL_C_EVENT on Windows, not a read-only query.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # Access denied: conservatively alive.
+        try:
+            code = wintypes.DWORD()
+            return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except PermissionError:
+        return True
+    except ProcessLookupError:
         return False
     except OSError:
         return False
@@ -237,7 +321,7 @@ def _list_sessions_since(work_dir: str, since_ms: int) -> list[str]:
     return [
         s.id
         for s in mgr.list()
-        if s.last_active > since_ts
+        if s.last_active.timestamp() > since_ts
     ]
 
 
@@ -269,7 +353,7 @@ def _build_consolidation_prompt(
         "",
         "## Phase 1 — Orient",
         "",
-        "- `ls` the memory directory to see what already exists",
+        "- Use Glob to list the memory directory",
         f"- Read `{ENTRYPOINT_NAME}` to understand the current index",
         "- Skim existing topic files so you improve them rather than creating duplicates",
         "",
@@ -306,9 +390,10 @@ def _build_consolidation_prompt(
         "",
         "---",
         "",
-        "**Tool constraints for this run:** Bash is restricted to read-only commands "
-        "(`ls`, `find`, `grep`, `cat`, `stat`, `wc`, `head`, `tail`, and similar). "
-        "Anything that writes, redirects to a file, or modifies state will be denied.",
+        "**Tool constraints for this run:** Use ReadFile, Glob and Grep for reading. "
+        "WriteFile, EditFile and DeleteMemory can only modify Markdown inside the "
+        "two memory directories. Read existing files before editing or deleting. "
+        "Commands and writes to code, configuration or transcripts are unavailable.",
         "",
     ]
 

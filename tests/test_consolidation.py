@@ -134,7 +134,6 @@ def test_prompt_contains_all_phases():
     not os.environ.get("YL1203Code_TEST_API_KEY"),
     reason="YL1203Code_TEST_API_KEY not set"
 )
-@pytest.mark.timeout(120)
 def test_e2e_consolidation_merges_duplicates():
     api_key = os.environ["YL1203Code_TEST_API_KEY"]
     base_url = os.environ.get("YL1203Code_TEST_BASE_URL", "https://api.minimaxi.com/v1")

@@ -14,21 +14,18 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_REGISTERED_SKILL_NAMES: set[str] = set()
-
-
 def register_skill_commands(
     registry: CommandRegistry,
     loader: SkillLoader,
     executor: SkillExecutor | None = None,
 ) -> None:
-    for name in list(_REGISTERED_SKILL_NAMES):
+    for name in list(registry._skill_names):
         if registry.find(name) is not None:
             registry._commands.pop(name, None)
             registry._alias_map = {
                 k: v for k, v in registry._alias_map.items() if v != name
             }
-        _REGISTERED_SKILL_NAMES.discard(name)
+        registry._skill_names.discard(name)
 
     for skill_name, skill_desc in loader.get_catalog():
         if registry.find(skill_name) is not None:
@@ -93,6 +90,6 @@ def register_skill_commands(
 
         try:
             registry.register_sync(cmd)
-            _REGISTERED_SKILL_NAMES.add(s_name)
+            registry._skill_names.add(s_name)
         except ValueError as e:
             log.warning("Cannot register skill command '%s': %s", s_name, e)

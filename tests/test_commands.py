@@ -452,8 +452,8 @@ class TestRegisterAllCommands:
         names = {c.name for c in cmds}
         expected = {
             "help", "compact", "clear", "plan",
-            "session", "mcp", "memory", "permission",
-            "sandbox", "rewind", "status", "skill",
+            "session", "resume", "mcp", "memory", "permission",
+            "sandbox", "rewind", "status", "skill", "review", "project", "diff", "test",
         }
         assert names == expected
 
@@ -474,3 +474,17 @@ class TestRegisterAllCommands:
         assert registry.find("p").name == "plan"
         assert registry.find("s").name == "status"
         assert registry.find("?").name == "help"
+
+
+@pytest.mark.asyncio
+async def test_review_command_is_available_and_submits_focus():
+    from YL1203Code.commands.handlers import register_all_commands
+    registry = CommandRegistry()
+    register_all_commands(registry)
+    command = registry.find('review')
+    assert command is not None
+    ui = MockUI()
+    await command.handler(_make_context(args='error handling', ui=ui))
+    assert len(ui.sent_messages) == 1
+    assert 'git diff' in ui.sent_messages[0]
+    assert 'error handling' in ui.sent_messages[0]

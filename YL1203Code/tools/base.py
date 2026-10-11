@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -18,6 +19,7 @@ ToolCategory = Literal["read", "write", "command"]
 class ToolResult:
     output: str
     is_error: bool = False
+    exit_code: int | None = None
 
 
 class Tool(ABC):
@@ -28,6 +30,13 @@ class Tool(ABC):
     is_concurrency_safe: bool = False
     is_system_tool: bool = False
     should_defer: bool = False
+    work_dir: str | None = None
+
+    def resolve_path(self, path: str) -> Path:
+        target = Path(path).expanduser()
+        if not target.is_absolute() and self.work_dir:
+            target = Path(self.work_dir) / target
+        return target.absolute()
 
     @property
     def is_read_only(self) -> bool:

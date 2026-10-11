@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import copy
 from typing import TYPE_CHECKING
 
 from YL1203Code.conversation import ConversationManager, Message
@@ -57,17 +58,41 @@ class SkillExecutor:
 
         fork_conv.add_user_message(prompt)
 
-        from YL1203Code.agent import Agent as AgentClass, StreamText, LoopComplete, ErrorEvent
+        from YL1203Code.agent import (
+            Agent as AgentClass, StreamText, LoopComplete, ErrorEvent,
+            PermissionRequest, PermissionResponse,
+        )
+        from YL1203Code.agents.tool_filter import ALL_AGENT_DISALLOWED_TOOLS
+
+        registry = self.agent.registry.copy()
+        # A skill fork cannot control the parent's UI, teams or worktree session.
+        for name in ALL_AGENT_DISALLOWED_TOOLS | {
+            "TeamCreate", "TeamDelete", "EnterWorktree", "ExitWorktree",
+        }:
+            registry.disable(name)
+        checker = self.agent.permission_checker
 
         fork_agent = AgentClass(
             client=self.client,
-            registry=self.agent.registry,
+            registry=registry,
             protocol=self.protocol,
             work_dir=self.agent.work_dir,
             max_iterations=self.agent.max_iterations,
-            permission_checker=None,
+            permission_checker=checker.copy() if checker else None,
             context_window=self.agent.context_window,
+            max_total_tokens=self.agent.max_total_tokens,
+            timeout_seconds=self.agent.timeout_seconds,
+            instructions_content=self.agent.instructions_content,
         )
+        fork_agent.parent_id = self.agent.agent_id
+        fork_agent.trace_id = self.agent.trace_id or self.agent.agent_id
+        fork_agent.active_skills = dict(self.agent.active_skills)
+        fork_agent.set_skill_catalog(self.agent._skill_catalog)
+        loader = registry.get("LoadSkill")
+        if loader is not None:
+            loader = copy.copy(loader)
+            loader.set_agent(fork_agent)
+            registry.register(loader)
 
         result_parts: list[str] = []
         async for event in fork_agent.run(fork_conv):
@@ -75,6 +100,9 @@ class SkillExecutor:
                 result_parts.append(event.text)
             elif isinstance(event, ErrorEvent):
                 result_parts.append(f"\n[Error: {event.message}]")
+            elif isinstance(event, PermissionRequest):
+                if not event.future.done():
+                    event.future.set_result(PermissionResponse.DENY)
             elif isinstance(event, LoopComplete):
                 break
 
@@ -85,7 +113,8 @@ class SkillExecutor:
         if mode == "none":
             return []
 
-        history = self.agent._conversation.history if hasattr(self.agent, '_conversation') else []
+        conversation = getattr(self.agent, "_current_conversation", None)
+        history = conversation.history if conversation is not None else []
         if not history:
             main_history = []
         else:

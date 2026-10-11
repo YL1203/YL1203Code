@@ -36,10 +36,9 @@ class WriteFile(Tool):
 
 
     async def execute(self, params: Params) -> ToolResult:
+        path = self.resolve_path(params.file_path)
         if self.file_history is not None:
-            self.file_history.track_edit(params.file_path)
-
-        path = Path(params.file_path)
+            self.file_history.track_edit(str(path))
 
         if self._state_cache and path.exists():
             resolved = str(path.resolve())

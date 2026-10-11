@@ -56,6 +56,7 @@ class CommandRegistry:
     def __init__(self) -> None:
         self._commands: dict[str, Command] = {}
         self._alias_map: dict[str, str] = {}
+        self._skill_names: set[str] = set()
         self._lock = asyncio.Lock()
 
     async def register(self, command: Command) -> None:

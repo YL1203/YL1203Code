@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from pathlib import Path
+
+import pytest
 from unittest.mock import MagicMock
 
 from YL1203Code.teams.manager import TeamManager
@@ -111,3 +114,8 @@ def test_second_team_create_does_not_corrupt_full_registry_snapshot():
         assert "WriteFile" in final_names
     finally:
         cleanup("coordbug3", "coordbug4")
+
+
+@pytest.fixture(autouse=True)
+def isolated_team_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: tmp_path))

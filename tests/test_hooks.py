@@ -286,14 +286,14 @@ class TestHttpExecutor:
 
 class TestAgentExecutor:
     @pytest.mark.asyncio
-    async def test_stub(self):
+    async def test_unconfigured_agent_hook_fails(self):
         from YL1203Code.hooks.executors import execute_agent
 
         action = Action(type="agent", prompt="Check $FILE_PATH")
         ctx = HookContext(file_path="test.py")
         result = await execute_agent(action, ctx)
-        assert result.success is True
-        assert "not yet implemented" in result.output
+        assert result.success is False
+        assert "not configured" in result.output
 
 class TestExecuteAction:
     @pytest.mark.asyncio

@@ -9,8 +9,13 @@ from YL1203Code.commands.handlers.permission import PERMISSION_COMMAND
 from YL1203Code.commands.handlers.plan import PLAN_COMMAND
 from YL1203Code.commands.handlers.sandbox import SANDBOX_COMMAND
 from YL1203Code.commands.handlers.session import SESSION_COMMAND
+from YL1203Code.commands.handlers.resume import RESUME_COMMAND
 from YL1203Code.commands.handlers.skill import SKILL_COMMAND
 from YL1203Code.commands.handlers.rewind import REWIND_COMMAND
+from YL1203Code.commands.handlers.review import REVIEW_COMMAND
+from YL1203Code.commands.handlers.project import PROJECT_COMMAND
+from YL1203Code.commands.handlers.diff import DIFF_COMMAND
+from YL1203Code.commands.handlers.test import TEST_COMMAND
 from YL1203Code.commands.handlers.status import STATUS_COMMAND
 from YL1203Code.commands.registry import CommandRegistry
 
@@ -21,11 +26,16 @@ ALL_COMMANDS = [
     CLEAR_COMMAND,
     PLAN_COMMAND,
     SESSION_COMMAND,
+    RESUME_COMMAND,
     MCP_COMMAND,
     MEMORY_COMMAND,
     PERMISSION_COMMAND,
     SANDBOX_COMMAND,
     REWIND_COMMAND,
+    REVIEW_COMMAND,
+    PROJECT_COMMAND,
+    DIFF_COMMAND,
+    TEST_COMMAND,
     STATUS_COMMAND,
     SKILL_COMMAND,
 ]

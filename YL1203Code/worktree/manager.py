@@ -170,12 +170,12 @@ class WorktreeManager:
     # 进入 worktree
     # ------------------------------------------------------------------
 
-    async def enter(self, name: str) -> WorktreeSession:
+    async def enter(self, name: str, original_work_dir: str | None = None) -> WorktreeSession:
         wt = self.active.get(name)
         if wt is None:
             raise WorktreeError(f"worktree not found: {name}")
 
-        original_cwd = os.getcwd()
+        original_cwd = original_work_dir or self.repo_root
         original_branch = self._get_current_branch()
         original_head = self._get_head_commit()
 

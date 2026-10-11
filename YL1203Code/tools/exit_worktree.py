@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -40,6 +40,7 @@ class ExitWorktreeTool(Tool):
 
     def __init__(self, worktree_manager: WorktreeManager) -> None:
         self._manager = worktree_manager
+        self._set_work_dir: Callable[[str], None] | None = None
 
 
     async def execute(self, params: ExitWorktreeParams) -> ToolResult:
@@ -93,6 +94,8 @@ class ExitWorktreeTool(Tool):
 
         try:
             await self._manager.exit(wt_name, action=action, discard_changes=discard)
+            if self._set_work_dir is not None:
+                self._set_work_dir(original_cwd)
         except Exception as e:
             return ToolResult(
                 output=f"Error exiting worktree: {e}", is_error=True

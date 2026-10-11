@@ -11,6 +11,7 @@ class PathSandbox:
     # 默认禁写路径：这些文件包含敏感配置，不允许 Agent 直接修改
     _DEFAULT_DENY_WRITE: list[str] = [
         ".YL1203Code/config.yaml",
+        ".YL1203Code/config.local.yaml",
         ".YL1203Code/permissions.local.yaml",
         ".YL1203Code/skills/",
     ]
@@ -22,6 +23,8 @@ class PathSandbox:
         deny_write: list[str] | None = None,
     ) -> None:
         root = Path(project_root).resolve()
+        self._extra_allowed = list(extra_allowed or [])
+        self._deny_write_config = list(deny_write or self._DEFAULT_DENY_WRITE)
         self._allowed_roots: list[Path] = [root, Path(tempfile.gettempdir()).resolve()]
         if extra_allowed:
             for p in extra_allowed:
@@ -39,6 +42,9 @@ class PathSandbox:
     @property
     def project_root(self) -> Path:
         return self._allowed_roots[0]
+
+    def with_project_root(self, project_root: str) -> PathSandbox:
+        return PathSandbox(project_root, self._extra_allowed, self._deny_write_config)
 
 
     def _is_deny_write(self, real_path: Path) -> bool:

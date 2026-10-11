@@ -205,13 +205,20 @@ class AgentTool(Tool):
             mode=pm_enum,
         )
 
+        if self._parent_agent.permission_checker:
+            checker = self._parent_agent.permission_checker.for_child(pm_enum, self._parent_agent.work_dir)
+
         # 创建子 agent
         sub_agent = AgentClass(
             client=client,
             registry=filtered_registry,
             protocol=self._parent_agent.protocol,
             work_dir=self._parent_agent.work_dir,
-            max_iterations=definition.max_turns,
+            max_iterations=min((limit for limit in (
+                definition.max_turns, self._parent_agent.max_iterations,
+            ) if limit > 0), default=0),
+            max_total_tokens=self._parent_agent.max_total_tokens,
+            timeout_seconds=self._parent_agent.timeout_seconds,
             permission_checker=checker,
             context_window=self._parent_agent.context_window,
             instructions_content=definition.system_prompt,
@@ -400,12 +407,21 @@ class AgentTool(Tool):
             mode=PermissionMode.BYPASS,
         )
 
+        if self._parent_agent.permission_checker:
+            checker = self._parent_agent.permission_checker.for_child(
+                PermissionMode.BYPASS, wt.path, self._parent_agent.work_dir,
+            )
+
         sub_agent = AgentClass(
             client=client,
             registry=teammate_registry,
             protocol=self._parent_agent.protocol,
             work_dir=wt.path,
-            max_iterations=definition.max_turns,
+            max_iterations=min((limit for limit in (
+                definition.max_turns, self._parent_agent.max_iterations,
+            ) if limit > 0), default=0),
+            max_total_tokens=self._parent_agent.max_total_tokens,
+            timeout_seconds=self._parent_agent.timeout_seconds,
             permission_checker=checker,
             context_window=self._parent_agent.context_window,
             instructions_content=instructions,
@@ -603,12 +619,21 @@ class AgentTool(Tool):
             mode=pm_enum,
         )
 
+        if self._parent_agent.permission_checker:
+            checker = self._parent_agent.permission_checker.for_child(
+                pm_enum, wt.path, self._parent_agent.work_dir,
+            )
+
         sub_agent = AgentClass(
             client=client,
             registry=filtered_registry,
             protocol=self._parent_agent.protocol,
             work_dir=wt.path,
-            max_iterations=definition.max_turns,
+            max_iterations=min((limit for limit in (
+                definition.max_turns, self._parent_agent.max_iterations,
+            ) if limit > 0), default=0),
+            max_total_tokens=self._parent_agent.max_total_tokens,
+            timeout_seconds=self._parent_agent.timeout_seconds,
             permission_checker=checker,
             context_window=self._parent_agent.context_window,
             instructions_content=definition.system_prompt,

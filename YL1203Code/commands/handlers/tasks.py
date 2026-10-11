@@ -18,7 +18,7 @@ def _format_elapsed(start: float, end: float | None) -> str:
 
 
 def _format_status(status: str) -> str:
-    icons = {"running": "⏳", "completed": "✓", "failed": "✗", "cancelled": "⊘"}
+    icons = {"running": "⏳", "completed": "✓", "failed": "✗", "cancelled": "⊘", "interrupted": "⊘"}
     return f"{icons.get(status, '?')} {status}"
 
 
@@ -29,6 +29,17 @@ def create_tasks_handler(task_manager: TaskManager):
         args = ctx.args.strip()
         parts = args.split(maxsplit=1) if args else []
         subcmd = parts[0] if parts else ""
+
+        if subcmd == "resume":
+            if len(parts) < 2 or ctx.agent is None:
+                ctx.ui.add_system_message("用法: /tasks resume <task-id>")
+                return
+            try:
+                new_id = task_manager.resume(parts[1].strip(), ctx.agent)
+                ctx.ui.add_system_message(f"已恢复任务，新任务 ID: {new_id}")
+            except (ValueError, KeyError, TypeError) as exc:
+                ctx.ui.add_system_message(f"恢复失败: {exc}")
+            return
 
         if subcmd == "info":
             if len(parts) < 2:
@@ -70,7 +81,8 @@ def create_tasks_handler(task_manager: TaskManager):
 
         # 默认：列出所有任务
         tasks = task_manager.list_tasks()
-        if not tasks:
+        saved = task_manager.saved_tasks()
+        if not tasks and not saved:
             ctx.ui.add_system_message("没有后台任务")
             return
 
@@ -80,6 +92,10 @@ def create_tasks_handler(task_manager: TaskManager):
             lines.append(
                 f"  [{bg.id}] {bg.name:<20} {_format_status(bg.status):<14} {elapsed}"
             )
+        for record in saved:
+            lines.append(f"  [{record['id']}] {record.get('name', '')} {_format_status(record['status'])} (已保存)")
+        if any(record["status"] in {"interrupted", "failed", "cancelled"} for record in saved):
+            lines.append("使用 /tasks resume <task-id> 手动恢复；恢复前会要求检查当前文件状态。")
         ctx.ui.add_system_message("\n".join(lines))
 
     return handler
@@ -92,5 +108,5 @@ def create_tasks_command(task_manager: TaskManager) -> Command:
         type=CommandType.LOCAL,
         handler=create_tasks_handler(task_manager),
         aliases=["task"],
-        usage="/tasks [info|cancel] [task-id]",
+        usage="/tasks [info|cancel|resume] [task-id]",
     )

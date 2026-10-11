@@ -1,6 +1,7 @@
  #YL1203Code
 from __future__ import annotations
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -67,39 +68,43 @@ class InlineResumeWidget(Vertical, can_focus=True):
         lines = []
         total = len(self._sessions)
         showing = len(self._filtered)
-        lines.append(f"[dim]Resume session ({showing} of {total})[/]\n")
+        lines.append(f"[dim]恢复历史对话（{showing}/{total}）[/]\n")
 
         if self._search:
             lines.append(f"┌{'─' * 30}┐")
-            lines.append(f"│⌕ {self._search:<28}│")
+            lines.append(f"│⌕ {escape(self._search):<28}│")
             lines.append(f"└{'─' * 30}┘")
         else:
             lines.append(f"┌{'─' * 30}┐")
-            lines.append(f"│[dim]⌕ Search…{'':>20}[/]│")
+            lines.append(f"│[dim]⌕ 搜索标题或会话ID{'':>12}[/]│")
             lines.append(f"└{'─' * 30}┘")
 
         if self._project:
-            lines.append(f"\n  [dim]{self._project}[/]\n")
+            lines.append(f"\n  [dim]{escape(self._project)}[/]\n")
 
-        for i, meta in enumerate(self._filtered[:10]):  # 最多显示 10 条
-            title = meta.title or "(empty session)"
+        start = (self._cursor // 10) * 10
+        for i, meta in enumerate(self._filtered[start:start + 10], start):
+            title = escape(meta.title or "（未命名）")
             if i == self._cursor:
                 lines.append(f"[bold cyan]❯[/] [bold]{title}[/]")
             else:
                 lines.append(f"  {title}")
 
-            parts = [_relative_time(meta)]
+            parts = [meta.last_active.astimezone().strftime("%Y-%m-%d %H:%M"),
+                     f"{meta.message_count} 条消息", meta.id]
             if hasattr(meta, 'branch') and meta.branch:
                 parts.append(meta.branch)
             if hasattr(meta, 'file_size') and meta.file_size:
                 parts.append(_format_size(meta.file_size))
-            lines.append(f"  [dim]{'  ·  '.join(parts)}[/]")
+            lines.append(f"  [dim]{escape('  ·  '.join(parts))}[/]")
             lines.append("")
 
         if showing > 10:
-            lines.append(f"  [dim]↓ {showing - 10} more session(s)[/]")
+            lines.append(f"  [dim]第 {start // 10 + 1}/{(showing + 9) // 10} 页 · 上下键翻页[/]")
 
-        lines.append("[dim]Type to search · Enter to select · Esc to cancel[/]")
+        if not self._filtered:
+            lines.append("[dim]没有匹配的对话[/]")
+        lines.append("[dim]输入搜索 · ↑↓ 选择 · Enter 恢复 · Esc 取消[/]")
         return "\n".join(lines)
 
     def _refresh(self) -> None:
@@ -125,7 +130,7 @@ class InlineResumeWidget(Vertical, can_focus=True):
             self._refresh()
 
     def action_cursor_down(self) -> None:
-        if self._cursor < min(len(self._filtered), 10) - 1:
+        if self._cursor < len(self._filtered) - 1:
             self._cursor += 1
             self._refresh()
 

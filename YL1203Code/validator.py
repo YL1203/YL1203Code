@@ -238,6 +238,20 @@ def validate_sandbox(raw_sb: dict | None) -> dict:
     return result
 
 
+def validate_execution(raw: dict | None) -> dict:
+    defaults = {"max_iterations": 40, "max_total_tokens": 0, "timeout_seconds": 0}
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ConfigError("'execution' must be a mapping")
+    for key in defaults:
+        value = raw.get(key, defaults[key])
+        if type(value) is not int or value < 0:
+            raise ConfigError(f"'execution.{key}' must be a non-negative integer")
+        defaults[key] = value
+    return defaults
+
+
 def validate_config_structure(raw: object) -> dict:
     """校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 
@@ -264,4 +278,5 @@ def validate_config_structure(raw: object) -> dict:
             raw.get("enable_coordinator_mode", False), "enable_coordinator_mode"
         ),
         "sandbox": validate_sandbox(raw.get("sandbox")),
+        "execution": validate_execution(raw.get("execution")),
     }

@@ -12,7 +12,7 @@ import shlex
 import shutil
 from pathlib import Path
 
-from YL1203Code.sandbox import Sandbox, SandboxConfig
+from YL1203Code.sandbox import Sandbox, SandboxConfig, protected_existing_paths
 
 
 class BwrapSandbox(Sandbox):
@@ -45,8 +45,8 @@ class BwrapSandbox(Sandbox):
             args.extend(["--bind", resolved, resolved])
 
         # 禁写路径：用 --ro-bind 强制只读（覆盖上面的 --bind）
-        for path in config.deny_write:
-            resolved = str(Path(path).resolve())
+        for path in protected_existing_paths(config.deny_write):
+            resolved = str(path)
             args.extend(["--ro-bind", resolved, resolved])
 
         # 网络隔离

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 import os
 import threading
 import time
@@ -17,6 +18,7 @@ class Backup:
     backup_path: str
     version: int
     timestamp: float
+    existed: bool = True
 
 
 @dataclass
@@ -34,6 +36,7 @@ class FileHistory:
         self._session_dir.mkdir(parents=True, exist_ok=True)
         self._tracked: dict[str, int] = {}
         self._snapshots: list[Snapshot] = []
+        self._existed: dict[tuple[str, int], bool] = {}
         self._lock = threading.Lock()
 
     def _backup_name(self, file_path: str, version: int) -> str:
@@ -50,8 +53,9 @@ class FileHistory:
                 data = Path(abs_path).read_bytes()
                 bp = self._session_dir / self._backup_name(abs_path, new_ver)
                 bp.write_bytes(data)
+                self._existed[abs_path, new_ver] = True
             except FileNotFoundError:
-                pass
+                self._existed[abs_path, new_ver] = False
 
             self._tracked[abs_path] = new_ver
 
@@ -59,15 +63,14 @@ class FileHistory:
         with self._lock:
             backups: dict[str, Backup] = {}
             for path, ver in self._tracked.items():
-                bp = self._session_dir / self._backup_name(path, ver)
-                if not bp.exists():
-                    try:
-                        data = Path(path).read_bytes()
-                        bp.write_bytes(data)
-                    except (FileNotFoundError, OSError):
-                        pass
+                bp = self._session_dir / (self._backup_name(path, ver) + f"-checkpoint-{time.time_ns()}")
+                try:
+                    bp.write_bytes(Path(path).read_bytes())
+                    existed = True
+                except FileNotFoundError:
+                    existed = False
                 backups[path] = Backup(
-                    backup_path=str(bp), version=ver, timestamp=time.time(),
+                    backup_path=str(bp), version=ver, timestamp=time.time(), existed=existed,
                 )
 
             self._snapshots.append(Snapshot(
@@ -87,24 +90,52 @@ class FileHistory:
         with self._lock:
             return len(self._snapshots) > 0
 
+    def _backups_at(self, snapshot_index: int | None) -> dict[str, Backup]:
+        backups = {path: Backup(
+            str(self._session_dir / self._backup_name(path, 1)), 1, 0,
+            self._existed.get((path, 1), True),
+        ) for path in self._tracked}
+        if snapshot_index is not None:
+            backups.update(self._snapshots[snapshot_index].backups)
+        return backups
+
+    def diff(self, snapshot_index: int | None = None) -> str:
+        """Preview this session's edits, or edits relative to a checkpoint."""
+        with self._lock:
+            backups = self._backups_at(snapshot_index)
+            chunks = []
+            for path, backup in backups.items():
+                try:
+                    before = Path(backup.backup_path).read_text(encoding="utf-8", errors="replace") if backup.existed else ""
+                    after = Path(path).read_text(encoding="utf-8", errors="replace") if Path(path).exists() else ""
+                except OSError:
+                    chunks.append(f"Cannot read change preview: {path}\n")
+                    continue
+                chunks.extend(difflib.unified_diff(
+                    before.splitlines(keepends=True), after.splitlines(keepends=True),
+                    fromfile=f"before/{path}", tofile=f"after/{path}",
+                ))
+            return "".join(chunks)
+
     def rewind(self, snapshot_index: int) -> list[str]:
         with self._lock:
             if snapshot_index < 0 or snapshot_index >= len(self._snapshots):
                 return []
 
-            target = self._snapshots[snapshot_index]
             changed: list[str] = []
 
-            for file_path, backup in target.backups.items():
-                bp = Path(backup.backup_path)
-                try:
-                    backup_data = bp.read_bytes()
-                except FileNotFoundError:
+            backups = self._backups_at(snapshot_index)
+            # Verify every required backup before changing any file.
+            data = {path: Path(backup.backup_path).read_bytes()
+                    for path, backup in backups.items() if backup.existed}
+            for file_path, backup in backups.items():
+                if not backup.existed:
                     fp = Path(file_path)
                     if fp.exists():
                         fp.unlink()
                         changed.append(file_path)
                     continue
+                backup_data = data[file_path]
 
                 fp = Path(file_path)
                 try:
@@ -118,7 +149,7 @@ class FileHistory:
                     changed.append(file_path)
 
             self._snapshots = self._snapshots[: snapshot_index + 1]
-            for file_path, backup in target.backups.items():
+            for file_path, backup in backups.items():
                 self._tracked[file_path] = backup.version
 
             return changed

@@ -23,7 +23,6 @@ from YL1203Code.agent import (
     HookEvent,
     LoopComplete,
     PermissionRequest,
-    PermissionResponse,
     RetryEvent,
     StreamText,
     ThinkingText,
@@ -48,7 +47,7 @@ from YL1203Code.commands import (
 from YL1203Code.commands.completion import CompletionPopup
 from YL1203Code.commands.handlers import register_all_commands
 from YL1203Code.config import MCPServerConfig, ProviderConfig
-from YL1203Code.hooks import HookContext, HookEngine, load_hooks
+from YL1203Code.hooks import HookEngine
 from YL1203Code.conversation import ConversationManager, Message
 from YL1203Code.mcp import ConnectResult, MCPManager
 from YL1203Code.memory import (
@@ -57,22 +56,16 @@ from YL1203Code.memory import (
     SessionManager,
     find_relevant_memories,
     generate_session_summary,
-    load_instructions,
     make_compact_boundary,
     render_reminder,
 )
-from YL1203Code.permissions import (
-    DangerousCommandDetector,
-    PathSandbox,
-    PermissionChecker,
-    PermissionMode,
-    RuleEngine,
-)
+from YL1203Code.permissions import PermissionMode
+from YL1203Code.memory.session import SessionMeta
+from YL1203Code.session_dialog import InlineResumeWidget
 from YL1203Code.agents.loader import AgentLoader
 from YL1203Code.agents.task_manager import TaskManager
 from YL1203Code.agents.trace import TraceManager
 from YL1203Code.agents.notification import inject_task_notifications
-from YL1203Code.commands.handlers.tasks import create_tasks_command
 from YL1203Code.skills.executor import SkillExecutor
 from YL1203Code.skills.loader import SkillLoader
 from YL1203Code.commands.handlers.skill_register import register_skill_commands
@@ -80,14 +73,11 @@ from rich.text import Text as RichText
 from textual.theme import Theme
 from YL1203Code.cache import FileCache
 from YL1203Code.tools import ToolRegistry, create_default_registry
-from YL1203Code.tools.agent_tool import AgentTool
 from YL1203Code.tools.ask_user import AskUserEvent, AskUserTool
-from YL1203Code.tools.impl.tool_search import ToolSearchTool
 from YL1203Code.tools.install_skill import InstallSkillTool
 from YL1203Code.tools.load_skill import LoadSkill
 from YL1203Code.worktree.cleanup import start_stale_cleanup_task
 from YL1203Code.worktree.manager import WorktreeManager
-from YL1203Code.commands.handlers.worktree import create_worktree_command
 from YL1203Code.teammate_tree import TeammateTree
 
 import re
@@ -601,6 +591,7 @@ class YL1203CodeApp(App):
         enable_coordinator_mode: bool = False,
         driver_class: type | None = None,
         sandbox_config: Any = None,
+        execution_config: Any = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
         self.providers = providers
@@ -614,6 +605,8 @@ class YL1203CodeApp(App):
         self._enable_coordinator_mode = enable_coordinator_mode
         from YL1203Code.config import SandboxAppConfig
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
+        self._execution_config = execution_config
+        self._runtime = None
         self.file_cache = FileCache()
         self.client: LLMClient | None = None
         self.conversation = ConversationManager()
@@ -710,245 +703,66 @@ class YL1203CodeApp(App):
             self._show_error(str(e))
             return
 
+        from YL1203Code.config import AppConfig, ExecutionConfig, WorktreeConfig
+        from YL1203Code.runtime import create_runtime, register_runtime_commands
+        from YL1203Code.tools.exit_plan_mode import ExitPlanModeTool
+
         work_dir = os.getcwd()
-        home = Path.home()
-
-        # 根据配置决定是否启用 OS 级沙箱自动放行
-        sandbox_auto_allow = False
-        checker = PermissionChecker(
-            detector=DangerousCommandDetector(),
-            sandbox=PathSandbox(work_dir),
-            rule_engine=RuleEngine(
-                user_rules_path=home / ".YL1203Code" / "permissions.yaml",
-                project_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.yaml",
-                local_rules_path=Path(work_dir) / ".YL1203Code" / "permissions.local.yaml",
-            ),
-            mode=self._initial_permission_mode,
-            sandbox_enabled=sandbox_auto_allow,
+        wt_cfg = self._worktree_config or WorktreeConfig()
+        config = AppConfig(
+            providers=[provider], enable_fork=self._enable_fork,
+            enable_verification_agent=self._enable_verification_agent,
+            worktree=wt_cfg, teammate_mode=self._teammate_mode,
+            enable_coordinator_mode=self._enable_coordinator_mode,
+            sandbox=self._sandbox_cfg,
+            execution=self._execution_config or ExecutionConfig(),
         )
-
-        # 如果配置启用了沙箱，为 Bash 工具挂载 OS 沙箱
-        if self._sandbox_cfg.enabled:
-            from YL1203Code.sandbox import SandboxConfig, create_sandbox
-            os_sandbox = create_sandbox()
-            if os_sandbox and os_sandbox.available():
-                sandbox_config = SandboxConfig(
-                    allow_write=[work_dir, "/tmp"],
-                    deny_write=[
-                        f"{work_dir}/.YL1203Code/config.yaml",
-                        f"{work_dir}/.YL1203Code/permissions.local.yaml",
-                    ],
-                    network_enabled=self._sandbox_cfg.network_enabled,
-                )
-                bash_tool = self.registry.get("Bash")
-                if bash_tool:
-                    bash_tool.sandbox = os_sandbox
-                    bash_tool.sandbox_config = sandbox_config
-                    checker.sandbox_enabled = self._sandbox_cfg.auto_allow
-
-        self._instructions_content = load_instructions(work_dir)
-        self.memory_manager = MemoryManager(work_dir)
-        self.session_manager = SessionManager(work_dir)
-        self.session_manager.cleanup()
-        self.session = self.session_manager.create()
-
-        from YL1203Code.filehistory import FileHistory
-        self.file_history = FileHistory(work_dir, self.session.session_id)
-        for tool in self.registry.list_tools():
-            if hasattr(tool, "file_history"):
-                tool.file_history = self.file_history
-
-        load_skill_tool = LoadSkill()
-        self.registry.register(load_skill_tool)
-        self._load_skill_tool = load_skill_tool
-
+        if self.session:
+            self.session.close()
+        runtime = create_runtime(
+            config, self._initial_permission_mode, work_dir, client=self.client,
+            registry=self.registry, hook_engine=self.hook_engine,
+            task_manager=self.task_manager, trace_manager=self.trace_manager,
+            is_interactive=True,
+        )
+        self._runtime = runtime
+        self.agent = runtime.agent
+        self.memory_manager = runtime.memory_manager
+        self.session_manager = runtime.session_manager
+        self.session = runtime.session
+        self.file_history = runtime.file_history
+        self._instructions_content = self.agent.instructions_content
+        self.skill_loader = runtime.skill_loader
+        self.skill_executor = runtime.skill_executor
+        self.agent_loader = runtime.agent_loader
+        self.worktree_manager = runtime.worktree_manager
+        self.team_manager = runtime.team_manager
+        self._load_skill_tool = self.registry.get('LoadSkill')
+        self.registry.register(AskUserTool())
+        self._exit_plan_tool = ExitPlanModeTool(
+            is_plan_mode=lambda: self.agent.plan_mode,
+            plan_exists=lambda: self.agent._get_plan_path().exists(),
+        )
+        self.registry.register(self._exit_plan_tool)
         install_skill_tool = InstallSkillTool()
+        install_skill_tool.set_loader(self.skill_loader)
+        install_skill_tool.set_on_installed(lambda name: register_skill_commands(
+            self.command_registry, self.skill_loader, self.skill_executor,
+        ))
         self.registry.register(install_skill_tool)
         self._install_skill_tool = install_skill_tool
-
-        self.registry.register(
-            ToolSearchTool(self.registry, protocol=provider.protocol)
-        )
-        self.registry.register(AskUserTool())
-
-        from YL1203Code.tools.exit_plan_mode import ExitPlanModeTool
-        self._exit_plan_tool = ExitPlanModeTool()
-        self.registry.register(self._exit_plan_tool)
-
-        self.agent = Agent(
-            client=self.client,
-            registry=self.registry,
-            protocol=provider.protocol,
-            work_dir=work_dir,
-            permission_checker=checker,
-            context_window=provider.get_context_window(),
-            instructions_content=self._instructions_content,
-            memory_manager=self.memory_manager,
-            hook_engine=self.hook_engine,
-        )
-        self.agent.file_history = self.file_history
-        self.agent.session_id = self.session.session_id
-
-        self._exit_plan_tool._is_plan_mode = lambda: self.agent.plan_mode
-        self._exit_plan_tool._plan_exists = lambda: self.agent._get_plan_path().exists()
-
-        # Layer 2: 在后台异步拉取模型的 context window，不阻塞启动流程。
-        # agent 已经有一个同步解析的窗口值（来自配置 / 映射表 / 默认值）；
-        # 如果异步拉取成功，就原地升级为更准确的值。
-        self.run_worker(
-            self._resolve_context_window(provider), exclusive=False
-        )
-
-        self.skill_loader = SkillLoader(work_dir)
-        self.skill_loader.load_all()
-
-        load_skill_tool.set_loader(self.skill_loader)
-        load_skill_tool.set_agent(self.agent)
-
-        install_skill_tool.set_loader(self.skill_loader)
-
-        self.skill_executor = SkillExecutor(
-            agent=self.agent,
-            client=self.client,
-            protocol=provider.protocol,
-        )
-
-        catalog = self.skill_loader.get_catalog()
-        if catalog:
-            lines = [
-                "You can use the following Skills:",
-                "",
-            ]
-            for name, desc in catalog:
-                lines.append(f"- {name}: {desc}")
-            lines.append("")
-            lines.append(
-                "If the user's request matches a Skill, call LoadSkill to activate it."
-            )
-            self.agent.set_skill_catalog("\n".join(lines))
-
-        register_skill_commands(
-            self.command_registry, self.skill_loader, self.skill_executor
-        )
-
-        # 安装新 skill 后重新注册斜杠命令，让 /<new-skill> 立即可用
-        def _on_skill_installed(name: str) -> None:
-            register_skill_commands(
-                self.command_registry, self.skill_loader, self.skill_executor
-            )
-
-        install_skill_tool.set_on_installed(_on_skill_installed)
-
-        # --- Worktree 系统初始化 ---
-        from YL1203Code.config import WorktreeConfig
-        wt_cfg = self._worktree_config or WorktreeConfig()
-        self.worktree_manager = WorktreeManager(
-            repo_root=work_dir,
-            symlink_directories=wt_cfg.symlink_directories,
-        )
-        restored = self.worktree_manager.restore_session()
-        if restored:
-            self.agent.work_dir = restored.worktree_path
-
-        wt_command = create_worktree_command(self.worktree_manager)
-        self.command_registry.register_sync(wt_command)
-
-        from YL1203Code.tools.enter_worktree import EnterWorktreeTool
-        from YL1203Code.tools.exit_worktree import ExitWorktreeTool
-        self.registry.register(EnterWorktreeTool(worktree_manager=self.worktree_manager))
-        self.registry.register(ExitWorktreeTool(worktree_manager=self.worktree_manager))
-
-        self._stale_cleanup_task = asyncio.create_task(
-            start_stale_cleanup_task(
-                self.worktree_manager,
-                wt_cfg.stale_cleanup_interval,
-                wt_cfg.stale_cutoff_hours,
-            )
-        )
-
-        # --- 子 agent 系统初始化 ---
-        self.agent_loader = AgentLoader(
-            work_dir, enable_verification=self._enable_verification_agent
-        )
-        self.agent_loader.load_all()
-
-        # --- Agent 团队系统初始化 ---
-        from YL1203Code.teams.manager import TeamManager
-        from YL1203Code.tools.team_create import TeamCreateTool
-        from YL1203Code.tools.team_delete import TeamDeleteTool
-
-        self.team_manager = TeamManager(worktree_manager=self.worktree_manager, trace_manager=self.trace_manager)
-
-        agent_tool = AgentTool(
-            agent_loader=self.agent_loader,
-            task_manager=self.task_manager,
-            trace_manager=self.trace_manager,
-            parent_agent=self.agent,
-            enable_fork=self._enable_fork,
-            provider_config=provider,
-            worktree_manager=self.worktree_manager,
-            team_manager=self.team_manager,
-        )
-        self.registry.register(agent_tool)
-
-        team_create_tool = TeamCreateTool(
-            team_manager=self.team_manager,
-            parent_agent=self.agent,
-            teammate_mode=self._teammate_mode,
-            is_interactive=True,
-            enable_coordinator_mode=self._enable_coordinator_mode,
-        )
-        self.registry.register(team_create_tool)
-
-        team_delete_tool = TeamDeleteTool(
-            team_manager=self.team_manager,
-            parent_agent=self.agent,
-        )
-        self.registry.register(team_delete_tool)
-
-        agent_catalog = self.agent_loader.list_agents()
-        if agent_catalog:
-            lines = [
-                "## Available Sub-Agent Types",
-                "",
-                "Use the Agent tool with subagent_type parameter to delegate tasks:",
-                "",
-            ]
-            for agent_type, when_to_use in agent_catalog:
-                lines.append(f"- **{agent_type}**: {when_to_use}")
-            if self._enable_fork:
-                lines.append("")
-                lines.append(
-                    "Leave subagent_type empty to fork the current conversation "
-                    "(inherits full dialog history)."
-                )
-            lines.append("")
-            lines.append(
-                "IMPORTANT: Sub-agents run in the background. "
-                "After calling the Agent tool, you will get a task ID immediately. "
-                "Do NOT wait, sleep, or poll for the result. "
-                "Simply report the task ID to the user and end your turn. "
-                "The system will automatically notify when the task completes."
-            )
-            self.agent.set_agent_catalog("\n".join(lines), catalog_list=agent_catalog)
-
-        tasks_cmd = create_tasks_command(self.task_manager)
-        self.command_registry.register_sync(tasks_cmd)
-
-        from YL1203Code.commands.handlers.trace import create_trace_command
-        trace_cmd = create_trace_command(self.trace_manager, self.agent.agent_id)
-        self.command_registry.register_sync(trace_cmd)
-
-        # --- 协调者模式初始化（工具已注册，激活推迟到 TeamCreate 时） ---
-        from YL1203Code.tools.synthetic_output import SyntheticOutputTool
-
-        self.registry.register(SyntheticOutputTool())
-        self.agent._team_manager = self.team_manager
+        register_runtime_commands(runtime, self.command_registry)
+        for warning in runtime.warnings:
+            self._show_system_message(warning)
+        self.run_worker(self._resolve_context_window(provider), exclusive=False)
+        self._stale_cleanup_task = asyncio.create_task(start_stale_cleanup_task(
+            self.worktree_manager, wt_cfg.stale_cleanup_interval, wt_cfg.stale_cutoff_hours,
+        ))
 
         if self.hook_engine:
             asyncio.ensure_future(
                 self.hook_engine.run_hooks(
-                    "startup", HookContext(event_name="startup")
+                    "startup", self.agent._build_hook_context("startup")
                 )
             )
 
@@ -1043,8 +857,10 @@ class YL1203CodeApp(App):
                 "set_conversation": self._set_conversation,
                 "clear_chat": self._clear_chat,
                 "render_restored": self._render_restored_messages,
+                "select_session": self._select_session,
                 "skill_loader": self.skill_loader,
                 "skill_executor": self.skill_executor,
+                "permission_handler": self._handle_permission_request,
             },
         )
 
@@ -1077,6 +893,9 @@ class YL1203CodeApp(App):
 
     async def _dispatch_command(self, text: str) -> None:
         name, args, is_command = parse_command(text)
+        if self._streaming:
+            self._show_system_message("当前操作尚未完成，请等待或按 Esc 取消。")
+            return
 
         if not is_command:
             if self._streaming or self.agent is None:
@@ -1106,10 +925,25 @@ class YL1203CodeApp(App):
             return
 
         ctx = self._build_command_context(args)
+        if cmd.name in {"test", "resume"}:
+            self._streaming = True
+            self._agent_task = asyncio.create_task(self._run_local_command(cmd, ctx))
+            return
         try:
             await cmd.handler(ctx)
         except Exception as e:
             self._show_error(f"命令执行失败: {e}")
+
+    async def _run_local_command(self, command, ctx) -> None:
+        try:
+            await command.handler(ctx)
+        except asyncio.CancelledError:
+            self._show_system_message("操作已取消。")
+        except Exception as exc:
+            self._show_error(f"命令执行失败: {exc}")
+        finally:
+            if self._agent_task is asyncio.current_task():
+                self._finish_streaming()
 
     # -----------------------------------------------------------------
     # 输入处理
@@ -1707,6 +1541,16 @@ class YL1203CodeApp(App):
         self._stop_spinner()
         self._stop_teammate_polling()
         self._agent_task = None
+        request = getattr(self, "_pending_perm_request", None)
+        if request is not None:
+            if not request.future.done():
+                request.future.cancel()
+            self._pending_perm_request = None
+            try:
+                self.query_one("#perm-inline").remove()
+                self.query_one("#chat-input").disabled = False
+            except Exception:
+                pass
         if self._teammate_tree is not None:
             self._teammate_tree.remove()
             self._teammate_tree = None
@@ -1783,6 +1627,8 @@ class YL1203CodeApp(App):
         from YL1203Code.permission_dialog import InlinePermissionWidget
 
         chat = self.query_one("#chat-area", VerticalScroll)
+        # Cancellation can leave a prompt waiting for Textual's async removal.
+        await chat.query("#perm-inline").remove()
         widget = InlinePermissionWidget(request.tool_name, request.description)
         self._pending_perm_request = request
         await chat.mount(widget)
@@ -1793,19 +1639,16 @@ class YL1203CodeApp(App):
         except Exception:
             pass
 
-    def on_inline_permission_widget_responded(
+    async def on_inline_permission_widget_responded(
         self, event: "InlinePermissionWidget.Responded"
     ) -> None:
         from YL1203Code.permission_dialog import InlinePermissionWidget
 
         req = getattr(self, "_pending_perm_request", None)
-        if req is not None:
-            req.future.set_result(event.response)
-            self._pending_perm_request = None
         # 从聊天区移除权限弹窗组件
         try:
             widget = self.query_one("#perm-inline", InlinePermissionWidget)
-            widget.remove()
+            await widget.remove()
         except Exception:
             pass
         # 重新启用输入框
@@ -1815,9 +1658,42 @@ class YL1203CodeApp(App):
         except Exception:
             pass
 
+        # Wake the agent only after the old prompt has been fully removed.
+        if req is not None and self._pending_perm_request is req:
+            self._pending_perm_request = None
+            if not req.future.done():
+                req.future.set_result(event.response)
+
     # -----------------------------------------------------------------
     # 恢复 session 的消息渲染
     # -----------------------------------------------------------------
+
+    async def _select_session(self, sessions: list[SessionMeta]) -> str | None:
+        chat = self.query_one("#chat-area", VerticalScroll)
+        chat_input = self.query_one("#chat-input")
+        await chat.query("#resume-inline").remove()
+        future = asyncio.get_running_loop().create_future()
+        self._resume_future = future
+        widget = InlineResumeWidget(sessions, project_name="当前项目")
+        was_disabled = chat_input.disabled
+        chat_input.disabled = True
+        try:
+            await chat.mount(widget)
+            self.call_after_refresh(chat.scroll_end, animate=False)
+            return await future
+        finally:
+            await widget.remove()
+            if self._resume_future is future:
+                self._resume_future = None
+            chat_input.disabled = was_disabled
+            chat_input.focus()
+
+    def on_inline_resume_widget_selected(
+        self, event: InlineResumeWidget.Selected
+    ) -> None:
+        future = getattr(self, "_resume_future", None)
+        if future is not None and not future.done():
+            future.set_result(event.session_id)
 
     async def _render_restored_messages(self, messages: list[Message]) -> None:
         chat = self.query_one("#chat-area", VerticalScroll)
@@ -1849,14 +1725,16 @@ class YL1203CodeApp(App):
     async def _update_session_summary(self) -> None:
         if not self.session or not self.client or not self.agent:
             return
+        session = self.session
+        conversation = self.conversation
         try:
             summary = await generate_session_summary(
-                self.client, self.conversation, self.agent.protocol
+                self.client, conversation, self.agent.protocol
             )
             if summary:
-                self.session.meta.summary = summary
-                self.session.meta.save(
-                    self.session._sessions_dir / f"{self.session.session_id}.meta"
+                session.meta.summary = summary
+                session.meta.save(
+                    session._sessions_dir / f"{session.session_id}.meta"
                 )
         except Exception:
             pass
@@ -1926,10 +1804,13 @@ class YL1203CodeApp(App):
 
     async def action_handle_ctrl_c(self) -> None:
         if self._streaming:
-            if self._agent_task and not self._agent_task.done():
-                self._agent_task.cancel()
+            task = self._agent_task
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             self._show_system_message("(response interrupted)")
-            self._finish_streaming()
+            if self._agent_task is task:
+                self._finish_streaming()
             try:
                 inp = self.query_one("#chat-input", ChatInput)
                 inp.disabled = False
@@ -1953,7 +1834,7 @@ class YL1203CodeApp(App):
             if self.hook_engine:
                 tasks.append(asyncio.create_task(
                     self.hook_engine.run_hooks(
-                        "shutdown", HookContext(event_name="shutdown")
+                        "shutdown", self.agent._build_hook_context("shutdown")
                     )
                 ))
             tasks.append(asyncio.create_task(self._shutdown_mcp()))
@@ -1977,7 +1858,9 @@ class YL1203CodeApp(App):
                     except Exception:
                         pass
 
-            if self.session:
+            if self._runtime:
+                await self._runtime.close()
+            elif self.session:
                 self.session.close()
 
         try:

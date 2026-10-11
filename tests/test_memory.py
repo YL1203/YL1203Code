@@ -134,7 +134,9 @@ class TestLoadInstructions:
         assert result.index("root level") < result.index("legacy level")
         assert "---" in result
 
-    def test_no_files_returns_empty(self, tmp_path: Path) -> None:
+    def test_no_files_returns_empty(self, tmp_path: Path, monkeypatch) -> None:
+        (tmp_path / '.git').mkdir()
+        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: tmp_path))
         result = load_instructions(str(tmp_path))
         assert result == ""
 
