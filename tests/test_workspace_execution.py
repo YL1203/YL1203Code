@@ -74,7 +74,12 @@ async def test_file_tools_and_shell_use_agent_workspace_without_chdir(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_switch_workspace_rebases_permissions_and_keeps_agents_independent(tmp_path):
+async def test_switch_workspace_rebases_permissions_and_keeps_agents_independent(tmp_path, monkeypatch):
+    # Keep the allowed temporary root distinct from the test workspace so this
+    # boundary assertion does not depend on pytest's default --basetemp location.
+    allowed_temp = tmp_path / "allowed-temp"
+    allowed_temp.mkdir()
+    monkeypatch.setattr("YL1203Code.permissions.sandbox.tempfile.gettempdir", lambda: str(allowed_temp))
     first, second = tmp_path / "first", tmp_path / "second"
     first.mkdir()
     second.mkdir()
@@ -101,6 +106,16 @@ async def test_switch_workspace_rebases_permissions_and_keeps_agents_independent
         {"file_path": str(tmp_path / "outside.txt"), "content": "blocked"},
     )
     assert outside.effect == "ask"
+    old_workspace = parent.permission_checker.check(
+        parent.registry.get("WriteFile"),
+        {"file_path": str(first / "code.txt"), "content": "blocked"},
+    )
+    assert old_workspace.effect == "ask"
+    allowed_temporary = parent.permission_checker.check(
+        parent.registry.get("WriteFile"),
+        {"file_path": str(allowed_temp / "scratch.txt"), "content": "allowed"},
+    )
+    assert allowed_temporary.effect == "allow"
 
 
 def test_switch_workspace_rebases_os_sandbox_write_boundaries(tmp_path):
