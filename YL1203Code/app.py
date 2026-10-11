@@ -661,11 +661,13 @@ class YL1203CodeApp(App):
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
         t = RichText()
-        t.append(" /\\_/\\    ", style="bold color(99)")
+        t.append("  ^-----^     ", style="bold color(211)")
         t.append("YL1203Code v0.1.0\n", style="color(242)")
-        t.append("( o.o )   ", style="bold color(99)")
+        t.append(" ( o(oo)o )   ", style="bold color(211)")
         t.append(f"{model}\n" if model else "\n", style="color(242)")
-        t.append(" > ^ <    ", style="bold color(99)")
+        t.append(" / ", style="bold color(211)")
+        t.append("YL1203", style="bold color(141)")
+        t.append(" \\~  ", style="bold color(211)")
         t.append(work_dir, style="color(242)")
         return t
 
