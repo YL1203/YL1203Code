@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import subprocess
 import time as _time
 from pathlib import Path
 from typing import Any
 
 from rich.markup import escape
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -571,7 +573,8 @@ class YL1203CodeApp(App):
     INLINE_PADDING = 0
     theme = "YL1203Code"
     BINDINGS = [
-        Binding("ctrl+c", "handle_ctrl_c", "Quit", priority=True),
+        Binding("ctrl+c", "handle_ctrl_c", "Copy / Interrupt", priority=True),
+        Binding("ctrl+q", "request_quit", "Quit", priority=True),
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("shift+tab", "cycle_mode", "Cycle mode", priority=True),
         Binding("ctrl+o", "toggle_tool_blocks", "Toggle tools", priority=True),
@@ -738,7 +741,7 @@ class YL1203CodeApp(App):
         self.worktree_manager = runtime.worktree_manager
         self.team_manager = runtime.team_manager
         self._load_skill_tool = self.registry.get('LoadSkill')
-        self.registry.register(AskUserTool())
+        self.registry.register(AskUserTool(on_request=self._handle_askuser))
         self._exit_plan_tool = ExitPlanModeTool(
             is_plan_mode=lambda: self.agent.plan_mode,
             plan_exists=lambda: self.agent._get_plan_path().exists(),
@@ -1049,6 +1052,10 @@ class YL1203CodeApp(App):
             popup.hide()
             self.query_one("#chat-input", ChatInput).focus()
             return
+        request = getattr(self, "_pending_askuser_event", None)
+        if request is not None and not request.future.done():
+            request.future.set_result(None)
+            return
         if self._agent_task and not self._agent_task.done():
             if self._subagent_task and not self._subagent_task.done():
                 task_id = self.task_manager.adopt_running(
@@ -1266,10 +1273,6 @@ class YL1203CodeApp(App):
                     if block:
                         block.set_result(event.output, event.is_error, event.elapsed)
                     self.call_after_refresh(chat.scroll_end, animate=False)
-
-                    ask_tool = self.registry.get("AskUserQuestion")
-                    if ask_tool and isinstance(ask_tool, AskUserTool) and ask_tool._pending_event:
-                        await self._handle_askuser(ask_tool._pending_event)
 
                 elif isinstance(event, TurnComplete):
                     if self.session:
@@ -1497,31 +1500,25 @@ class YL1203CodeApp(App):
         chat = self.query_one("#chat-area", VerticalScroll)
         widget = InlineAskUserWidget(event.questions)
         self._pending_askuser_event = event
-        await chat.mount(widget)
-        self.call_after_refresh(chat.scroll_end, animate=False)
+        inp = self.query_one("#chat-input")
         try:
-            self.query_one("#chat-input").disabled = True
-        except Exception:
-            pass
+            await chat.mount(widget)
+            inp.disabled = True
+            widget.focus()
+            self.call_after_refresh(chat.scroll_end, animate=False)
+            await event.future
+        finally:
+            await widget.remove()
+            self._pending_askuser_event = None
+            inp.disabled = False
+            inp.focus()
 
     def on_inline_ask_user_widget_responded(
         self, event: "InlineAskUserWidget.Responded"
     ) -> None:
-        from YL1203Code.askuser_dialog import InlineAskUserWidget
-
         req = getattr(self, "_pending_askuser_event", None)
         if req is not None and not req.future.done():
-            req.future.set_result(event.answers if event.answers else {})
-            self._pending_askuser_event = None
-        try:
-            self.query_one("#askuser-inline", InlineAskUserWidget).remove()
-        except Exception:
-            pass
-        try:
-            self.query_one("#chat-input").disabled = False
-            self.query_one("#chat-input").focus()
-        except Exception:
-            pass
+            req.future.set_result(event.answers)
 
     def _start_spinner(self) -> None:
         """启动 braille spinner 动画（每帧 80ms）。"""
@@ -1802,7 +1799,43 @@ class YL1203CodeApp(App):
     # 退出
     # -----------------------------------------------------------------
 
+    def copy_to_clipboard(self, text: str) -> None:
+        if os.name != "nt":
+            super().copy_to_clipboard(text)
+            return
+        self._clipboard = text
+        try:
+            # Windows terminals don't all support Textual's OSC 52 clipboard.
+            subprocess.run(
+                ["clip.exe"], input=text.encode("utf-16"), check=True,
+                timeout=3, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.notify("无法写入系统剪贴板，请重试", severity="error")
+
+    def _copy_selected_text(self) -> bool:
+        get_selection = getattr(self.screen, "get_selected_text", None)
+        text = get_selection() if get_selection is not None else None
+        if not text and isinstance(self.focused, TextArea):
+            text = self.focused.selected_text
+        if not text:
+            return False
+        self.copy_to_clipboard(text)
+        return True
+
+    async def on_event(self, event: events.Event) -> None:
+        if (
+            isinstance(event, (events.MouseDown, events.MouseUp))
+            and event.button == 3 and not event.is_forwarded
+        ):
+            if isinstance(event, events.MouseDown):
+                self._copy_selected_text()
+            return
+        await super().on_event(event)
+
     async def action_handle_ctrl_c(self) -> None:
+        if self._copy_selected_text():
+            return
         if self._streaming:
             task = self._agent_task
             if task and not task.done():
@@ -1819,6 +1852,14 @@ class YL1203CodeApp(App):
                 pass
             return
 
+        self.notify("请先选中文本再复制；退出请按 Ctrl+Q")
+
+    async def action_request_quit(self) -> None:
+        if self._streaming:
+            task = self._agent_task
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         if getattr(self, "_exit_requested", False):
             self.exit()
             return

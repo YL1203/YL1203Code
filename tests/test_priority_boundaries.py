@@ -276,6 +276,7 @@ async def test_tui_ctrl_c_keeps_busy_until_local_command_cleanup_finishes():
     from YL1203Code.app import YL1203CodeApp
     started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     app = SimpleNamespace(_streaming=True, _agent_task=None)
+    app._copy_selected_text = lambda: False
     app._show_system_message = lambda message: None
     app._show_error = lambda message: None
     app.query_one = lambda *args: None
